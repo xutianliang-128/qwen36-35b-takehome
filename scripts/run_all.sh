@@ -131,7 +131,9 @@ tb2() {  # tb2 <model_path> <served_name>
   export PATH=$HOME/.conda/envs/qwen36/bin:$PATH
   if [ -f "$job/config.json" ]; then
     log "TB2 $2: resuming"
-    harbor job resume -p "$job" >> "logs/tb2_$2.log" 2>&1
+    # the agent's LiteLLM client must get the vLLM key (not the OpenAI judge key loaded from .env), else 401s;
+    # trials that failed on auth are dropped and re-run
+    OPENAI_API_KEY=$VLLM_API_KEY harbor job resume -p "$job" -f AuthenticationError >> "logs/tb2_$2.log" 2>&1
   else
     log "TB2 $2: starting"
     VLLM_URL=http://localhost:8100 bash scripts/run_tb2.sh "$2" tb2-run1 -k 1 -n 32 >> "logs/tb2_$2.log" 2>&1

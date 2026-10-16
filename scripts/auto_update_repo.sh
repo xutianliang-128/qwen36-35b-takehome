@@ -5,14 +5,15 @@ cd "$(dirname "$0")/.."
 export PYTHONNOUSERSITE=1
 PY=~/.conda/envs/qwen36/bin/python
 J=results/expert-e_agent/terminal-bench/tb2-run1/tb2-run1/result.json
-until [ -f "$J" ] && $PY -c "import json,sys;sys.exit(0 if json.load(open('$J')).get('finished_at') else 1)"; do sleep 300; done
+# finished AND no infrastructure auth failures (a resume without the vLLM key once produced 58 x 401 "finished" trials)
+until [ -f "$J" ] && $PY -c "import json,sys,glob;d=json.load(open('$J'));ok=d.get('finished_at') and not any((json.load(open(f)).get('exception_info') or {}).get('exception_type')=='AuthenticationError' for f in glob.glob('$(dirname $J)/*/result.json'));sys.exit(0 if ok else 1)"; do sleep 300; done
 echo "[$(date -u +%FT%TZ)] E_agent TB2 finished"
 $PY scripts/summarize.py > /dev/null 2>&1
 $PY - <<'PYEOF'
 import csv
 S = {(r["model"], r["benchmark"]): r for r in csv.DictReader(open("results/summary.csv"))}
 r = S[("expert-e_agent", "terminal_bench")]
-v = f"{r['score_pct']}（{r['diff_vs_base_pp']:+} [{r['ci95_low']}, {r['ci95_high']}] vs Base）" if r.get("diff_vs_base_pp") else r["score_pct"]
+v = f"{r['score_pct']}（{float(r['diff_vs_base_pp']):+.2f} [{r['ci95_low']}, {r['ci95_high']}] vs Base）" if r.get("diff_vs_base_pp") else r["score_pct"]
 ve = v.replace("（", " (").replace("）", ")")
 zh = open("README.md").read(); en = open("README_en.md").read()
 zh = zh.replace("| E_agent | 终端 / agent 专家 | — | 运行中（目标） |", "| E_agent | 终端 / agent 专家 | — | ✅（目标） |")
