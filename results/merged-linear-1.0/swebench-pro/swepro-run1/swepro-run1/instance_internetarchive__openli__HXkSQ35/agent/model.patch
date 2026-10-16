@@ -1,0 +1,216 @@
+diff --git a/openlibrary/plugins/importapi/code.py b/openlibrary/plugins/importapi/code.py
+index 2aec07635..74d8a2302 100644
+--- a/openlibrary/plugins/importapi/code.py
++++ b/openlibrary/plugins/importapi/code.py
+@@ -31,6 +31,12 @@ import logging
+ 
+ import urllib
+ 
++from openlibrary.plugins.upstream.utils import (
++    get_abbrev_from_full_lang_name,
++    LanguageMultipleMatchError,
++    LanguageNoMatchError,
++)
++
+ MARC_LENGTH_POS = 5
+ logger = logging.getLogger('openlibrary.importapi')
+ 
+@@ -348,8 +354,26 @@ class ia_importapi(importapi):
+             d['description'] = description
+         if isbn:
+             d['isbn'] = isbn
+-        if language and len(language) == 3:
+-            d['languages'] = [language]
++        # Resolve language name to abbreviation
++        if language:
++            try:
++                abbr = get_abbrev_from_full_lang_name(language)
++                d['languages'] = [abbr]
++            except LanguageMultipleMatchError:
++                logger.warning('Multiple language matches for %s', language)
++            except LanguageNoMatchError:
++                logger.warning('No language matches for %s', language)
++        # Handle imagecount for number_of_pages
++        if 'imagecount' in metadata:
++            try:
++                imagecount = int(metadata['imagecount'])
++                computed_pages = imagecount - 4
++                if computed_pages >= 1:
++                    d['number_of_pages'] = computed_pages
++                else:
++                    d['number_of_pages'] = imagecount
++            except (ValueError, TypeError):
++                pass  # Skip if imagecount is not a valid integer
+         if lccn:
+             d['lccn'] = [lccn]
+         if subject:
+diff --git a/openlibrary/plugins/upstream/utils.py b/openlibrary/plugins/upstream/utils.py
+index 7d36f86d4..bc3885e08 100644
+--- a/openlibrary/plugins/upstream/utils.py
++++ b/openlibrary/plugins/upstream/utils.py
+@@ -41,6 +41,165 @@ from openlibrary.core.middleware import GZipMiddleware
+ from openlibrary.core import cache
+ 
+ 
++
++
++class LanguageMultipleMatchError(Exception):
++    """Exception raised when more than one possible language match is found."""
++
++    def __init__(self, language_name: str):
++        self.language_name = language_name
++        super().__init__(f"Multiple language matches for '{language_name}'")
++
++
++class LanguageNoMatchError(Exception):
++    """Exception raised when no matching languages are found."""
++
++    def __init__(self, language_name: str):
++        self.language_name = language_name
++        super().__init__(f"No language matches found for '{language_name}'")
++
++
++def get_abbrev_from_full_lang_name(input_lang_name: str, languages=None) -> str:
++    """Returns the three-character language code matching the given language name
++    by searching canonical and translated language names.
++
++    Args:
++        input_lang_name: The language name to search for
++        languages: Optional dict of languages. If None, uses get_languages().
++
++    Returns:
++        The three-character language code
++
++    Raises:
++        LanguageMultipleMatchError: When more than one language matches
++        LanguageNoMatchError: When no language matches
++    """
++    if languages is None:
++        languages = get_languages()
++
++    # Normalize the input: lowercase and strip accents
++    normalized_input = strip_accents(input_lang_name).lower()
++
++    matches = set()  # Track matched language keys to count per distinct language
++
++    for lang_key, lang_obj in languages.items():
++        # Get canonical name
++        canonical_name = getattr(lang_obj, 'name', '')
++        canonical_normalized = strip_accents(canonical_name).lower()
++
++        is_match = False
++
++        # Check canonical name
++        if canonical_normalized == normalized_input:
++            is_match = True
++
++        # Check translated names if available
++        if not is_match:
++            name_translated = getattr(lang_obj, 'name_translated', {})
++            if name_translated:
++                for lang_code_list in name_translated.values():
++                    if isinstance(lang_code_list, list):
++                        for translated_name in lang_code_list:
++                            translated_normalized = strip_accents(translated_name).lower()
++                            if translated_normalized == normalized_input:
++                                is_match = True
++                                break
++                    if is_match:
++                        break
++
++        if is_match:
++            matches.add(lang_key)
++
++    num_matches = len(matches)
++
++    if num_matches > 1:
++        raise LanguageMultipleMatchError(input_lang_name)
++    elif num_matches == 0:
++        raise LanguageNoMatchError(input_lang_name)
++    else:
++        # Exactly one match
++        return languages[next(iter(matches))].code
++
++
++
++class LanguageMultipleMatchError(Exception):
++    """Exception raised when more than one possible language match is found."""
++
++    def __init__(self, language_name: str):
++        self.language_name = language_name
++        super().__init__(f"Multiple language matches for '{language_name}'")
++
++
++class LanguageNoMatchError(Exception):
++    """Exception raised when no matching languages are found."""
++
++    def __init__(self, language_name: str):
++        self.language_name = language_name
++        super().__init__(f"No language matches found for '{language_name}'")
++
++
++def get_abbrev_from_full_lang_name(input_lang_name: str, languages=None) -> str:
++    """Returns the three-character language code matching the given language name
++    by searching canonical and translated language names.
++
++    Args:
++        input_lang_name: The language name to search for
++        languages: Optional dict of languages. If None, uses get_languages().
++
++    Returns:
++        The three-character language code
++
++    Raises:
++        LanguageMultipleMatchError: When more than one language matches
++        LanguageNoMatchError: When no language matches
++    """
++    if languages is None:
++        languages = get_languages()
++
++    # Normalize the input: lowercase and strip accents
++    normalized_input = strip_accents(input_lang_name).lower()
++
++    matches = set()  # Track matched language keys to count per distinct language
++
++    for lang_key, lang_obj in languages.items():
++        # Get canonical name
++        canonical_name = getattr(lang_obj, 'name', '')
++        canonical_normalized = strip_accents(canonical_name).lower()
++
++        is_match = False
++
++        # Check canonical name
++        if canonical_normalized == normalized_input:
++            is_match = True
++
++        # Check translated names if available
++        if not is_match:
++            name_translated = getattr(lang_obj, 'name_translated', {})
++            if name_translated:
++                for lang_code_list in name_translated.values():
++                    if isinstance(lang_code_list, list):
++                        for translated_name in lang_code_list:
++                            translated_normalized = strip_accents(translated_name).lower()
++                            if translated_normalized == normalized_input:
++                                is_match = True
++                                break
++                    if is_match:
++                        break
++
++        if is_match:
++            matches.add(lang_key)
++
++    num_matches = len(matches)
++
++    if num_matches > 1:
++        raise LanguageMultipleMatchError(input_lang_name)
++    elif num_matches == 0:
++        raise LanguageNoMatchError(input_lang_name)
++    else:
++        # Exactly one match
++        return languages[next(iter(matches))].code
++
++
+ class MultiDict(MutableMapping):
+     """Ordered Dictionary that can store multiple values.
+ 

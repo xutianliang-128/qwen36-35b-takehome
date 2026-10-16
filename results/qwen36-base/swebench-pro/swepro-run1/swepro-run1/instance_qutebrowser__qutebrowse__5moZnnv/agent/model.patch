@@ -1,0 +1,196 @@
+diff --git a/qutebrowser/keyinput/keyutils.py b/qutebrowser/keyinput/keyutils.py
+index ae8885559..8708206af 100644
+--- a/qutebrowser/keyinput/keyutils.py
++++ b/qutebrowser/keyinput/keyutils.py
+@@ -41,7 +41,9 @@ from qutebrowser.qt.gui import QKeySequence, QKeyEvent
+ try:
+     from qutebrowser.qt.core import QKeyCombination
+ except ImportError:
+-    pass  # Qt 6 only
++    # Qt 5 only - define as a dummy so annotations like Union[int, QKeyCombination]
++    # can be evaluated at import time
++    QKeyCombination = int  # type: ignore[misc,assignment]
+ 
+ from qutebrowser.utils import utils
+ 
+@@ -105,17 +107,17 @@ _SPECIAL_NAMES = {
+     Qt.Key.Key_Dead_Horn: 'Horn',
+ 
+     Qt.Key.Key_Dead_Stroke: '\u0335',  # '̵'
+-    Qt.Key.Key_Dead_Abovecomma: '\u0313',  # '̓'
+-    Qt.Key.Key_Dead_Abovereversedcomma: '\u0314',  # '̔'
+-    Qt.Key.Key_Dead_Doublegrave: '\u030f',  # '̏'
+-    Qt.Key.Key_Dead_Belowring: '\u0325',  # '̥'
++    Qt.Key.Key_Dead_Abovecomma: '\u0313',  # 'ӓ'
++    Qt.Key.Key_Dead_Abovereversedcomma: '\u0314',  # 'Ӕ'
++    Qt.Key.Key_Dead_Doublegrave: '\u030f',  # 'ߏ'
++    Qt.Key.Key_Dead_Belowring: '\u0325',  # '˥'
+     Qt.Key.Key_Dead_Belowmacron: '\u0331',  # '̱'
+-    Qt.Key.Key_Dead_Belowcircumflex: '\u032d',  # '̭'
++    Qt.Key.Key_Dead_Belowcircumflex: '\u032d',  # '˭'
+     Qt.Key.Key_Dead_Belowtilde: '\u0330',  # '̰'
+-    Qt.Key.Key_Dead_Belowbreve: '\u032e',  # '̮'
+-    Qt.Key.Key_Dead_Belowdiaeresis: '\u0324',  # '̤'
+-    Qt.Key.Key_Dead_Invertedbreve: '\u0311',  # '̑'
+-    Qt.Key.Key_Dead_Belowcomma: '\u0326',  # '̦'
++    Qt.Key.Key_Dead_Belowbreve: '\u032e',  # 'ˮ'
++    Qt.Key.Key_Dead_Belowdiaeresis: '\u0324',  # 'Ȥ'
++    Qt.Key.Key_Dead_Invertedbreve: '\u0311',  # 'ӑ'
++    Qt.Key.Key_Dead_Belowcomma: '\u0326',  # '˦'
+     Qt.Key.Key_Dead_Currency: '¤',
+     Qt.Key.Key_Dead_a: 'a',
+     Qt.Key.Key_Dead_A: 'A',
+@@ -128,10 +130,10 @@ _SPECIAL_NAMES = {
+     Qt.Key.Key_Dead_u: 'u',
+     Qt.Key.Key_Dead_U: 'U',
+     Qt.Key.Key_Dead_Small_Schwa: 'ə',
+-    Qt.Key.Key_Dead_Capital_Schwa: 'Ə',
++    Qt.Key.Key_Dead_Capital_Schwa: 'Ǐ',
+     Qt.Key.Key_Dead_Greek: 'Greek',
+     Qt.Key.Key_Dead_Lowline: '\u0332',  # '̲'
+-    Qt.Key.Key_Dead_Aboveverticalline: '\u030d',  # '̍'
++    Qt.Key.Key_Dead_Aboveverticalline: '\u030d',  # '̀'
+     Qt.Key.Key_Dead_Belowverticalline: '\u0329',
+     Qt.Key.Key_Dead_Longsolidusoverlay: '\u0338',  # '̸'
+ 
+@@ -232,8 +234,7 @@ def _check_valid_utf8(s: str, data: Union[Qt.Key, _ModifierType]) -> None:
+     try:
+         s.encode('utf-8')
+     except UnicodeEncodeError as e:  # pragma: no cover
+-        raise ValueError("Invalid encoding in 0x{:x} -> {}: {}"
+-                         .format(int(data), s, e))
++        raise ValueError("Invalid encoding in 0x{:x} -> {}: {}".format(int(data), s, e))
+ 
+ 
+ def _key_to_string(key: Qt.Key) -> str:
+@@ -351,12 +352,12 @@ class KeyInfo:
+     """A key with optional modifiers.
+ 
+     Attributes:
+-        key: A Qt::Key member.
++        key: A Qt::Key member (or any int key value).
+         modifiers: A Qt::KeyboardModifiers enum value.
+     """
+ 
+-    key: Qt.Key
+-    modifiers: _ModifierType
++    key: int
++    modifiers: _ModifierType = Qt.KeyboardModifier.NoModifier
+ 
+     @classmethod
+     def from_event(cls, e: QKeyEvent) -> 'KeyInfo':
+@@ -382,7 +383,7 @@ class KeyInfo:
+             return cls(key, modifiers)
+         else:
+             # QKeyCombination is now guaranteed to be available here
+-            assert isinstance(combination, QKeyCombination)  
++            assert isinstance(combination, QKeyCombination)  # type: ignore[unreachable]
+             return cls(
+                 key=combination.key(),
+                 modifiers=combination.keyboardModifiers(),
+@@ -403,8 +404,7 @@ class KeyInfo:
+         elif _is_printable(self.key):
+             # "normal" binding
+             if not key_string:  # pragma: no cover
+-                raise ValueError("Got empty string for key 0x{:x}!"
+-                                 .format(self.key))
++                raise ValueError("Got empty string for key 0x{:x}!".format(self.key))
+ 
+             assert len(key_string) == 1, key_string
+             if self.modifiers == Qt.KeyboardModifier.ShiftModifier:
+@@ -453,6 +453,20 @@ class KeyInfo:
+         """Get the key as an integer (with key/modifiers)."""
+         return int(self.key) | int(self.modifiers)
+ 
++    def to_qt(self) -> Union[int, 'QKeyCombination']:
++        """Return a value suitable for QKeySequence.
++
++        Returns an integer for Qt5 or QKeyCombination for Qt6.
++        """
++        if QKeyCombination is not int:  # Qt6
++            return QKeyCombination.fromKeyAndModifiers(int(self.key), self.modifiers)
++        else:  # Qt5
++            return self.to_int()
++
++    def with_stripped_modifiers(self, modifiers: _ModifierType) -> 'KeyInfo':
++        """Return a new KeyInfo with the specified modifiers removed."""
++        return KeyInfo(self.key, self.modifiers & ~modifiers)
++
+ 
+ class KeySequence:
+ 
+@@ -473,21 +487,16 @@ class KeySequence:
+ 
+     _MAX_LEN = 4
+ 
+-    def __init__(self, *keys: int) -> None:
++    def __init__(self, *keys: KeyInfo) -> None:
+         self._sequences: List[QKeySequence] = []
+         for sub in utils.chunk(keys, self._MAX_LEN):
+-            args = [self._convert_key(key) for key in sub]
++            args = [key.to_qt() for key in sub]
+             sequence = QKeySequence(*args)
+             self._sequences.append(sequence)
+         if keys:
+             assert self
+         self._validate()
+ 
+-    def _convert_key(self, key: Union[int, Qt.KeyboardModifier]) -> int:
+-        """Convert a single key for QKeySequence."""
+-        assert isinstance(key, (int, Qt.KeyboardModifiers)), key
+-        return int(key)
+-
+     def __str__(self) -> str:
+         parts = []
+         for info in self:
+@@ -543,8 +552,8 @@ class KeySequence:
+ 
+     def __getitem__(self, item: Union[int, slice]) -> Union[KeyInfo, 'KeySequence']:
+         if isinstance(item, slice):
+-            keys = list(self._iter_keys())
+-            return self.__class__(*keys[item])
++            infos = list(self)
++            return self.__class__(*infos[item])
+         else:
+             infos = list(self)
+             return infos[item]
+@@ -650,16 +659,15 @@ class KeySequence:
+                 modifiers &= ~Qt.KeyboardModifier.MetaModifier
+                 modifiers |= Qt.KeyboardModifier.ControlModifier
+ 
+-        keys = list(self._iter_keys())
+-        keys.append(key | int(modifiers))
++        info = KeyInfo(key, modifiers)
+ 
+-        return self.__class__(*keys)
++        return self.__class__(*(list(self) + [info]))
+ 
+     def strip_modifiers(self) -> 'KeySequence':
+         """Strip optional modifiers from keys."""
+         modifiers = Qt.KeyboardModifier.KeypadModifier
+-        keys = [key & ~modifiers for key in self._iter_keys()]
+-        return self.__class__(*keys)
++        new_infos = [info.with_stripped_modifiers(modifiers) for info in self]
++        return self.__class__(*new_infos)
+ 
+     def with_mappings(
+             self,
+@@ -667,12 +675,14 @@ class KeySequence:
+     ) -> 'KeySequence':
+         """Get a new KeySequence with the given mappings applied."""
+         keys = []
+-        for key in self._iter_keys():
+-            key_seq = KeySequence(key)
++        for info in self:
++            key_seq = KeySequence(info)
+             if key_seq in mappings:
+-                keys += [info.to_int() for info in mappings[key_seq]]
++                # Add KeyInfo objects from the mapped sequence
++                keys += list(mappings[key_seq])
+             else:
+-                keys.append(key)
++                # Keep the original KeyInfo
++                keys.append(info)
+         return self.__class__(*keys)
+ 
+     @classmethod

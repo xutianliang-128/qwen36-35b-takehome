@@ -1,0 +1,353 @@
+diff --git a/src/voice-broadcast/components/molecules/VoiceBroadcastPlaybackBody.tsx b/src/voice-broadcast/components/molecules/VoiceBroadcastPlaybackBody.tsx
+index 1d6b89dca9..bb3de10c73 100644
+--- a/src/voice-broadcast/components/molecules/VoiceBroadcastPlaybackBody.tsx
++++ b/src/voice-broadcast/components/molecules/VoiceBroadcastPlaybackBody.tsx
+@@ -28,6 +28,7 @@ import { Icon as PlayIcon } from "../../../../res/img/element-icons/play.svg";
+ import { Icon as PauseIcon } from "../../../../res/img/element-icons/pause.svg";
+ import { _t } from "../../../languageHandler";
+ import Clock from "../../../components/views/audio_messages/Clock";
++import SeekBar from "../../../components/views/audio_messages/SeekBar";
+ 
+ interface VoiceBroadcastPlaybackBodyProps {
+     playback: VoiceBroadcastPlayback;
+@@ -37,7 +38,7 @@ export const VoiceBroadcastPlaybackBody: React.FC<VoiceBroadcastPlaybackBodyProp
+     playback,
+ }) => {
+     const {
+-        length,
++        duration,
+         live,
+         room,
+         sender,
+@@ -75,8 +76,6 @@ export const VoiceBroadcastPlaybackBody: React.FC<VoiceBroadcastPlaybackBodyProp
+         />;
+     }
+ 
+-    const lengthSeconds = Math.round(length / 1000);
+-
+     return (
+         <div className="mx_VoiceBroadcastBody">
+             <VoiceBroadcastHeader
+@@ -89,7 +88,8 @@ export const VoiceBroadcastPlaybackBody: React.FC<VoiceBroadcastPlaybackBodyProp
+                 { control }
+             </div>
+             <div className="mx_VoiceBroadcastBody_timerow">
+-                <Clock seconds={lengthSeconds} />
++                <SeekBar playback={playback} />
++                <Clock seconds={duration} />
+             </div>
+         </div>
+     );
+diff --git a/src/voice-broadcast/hooks/useVoiceBroadcastPlayback.ts b/src/voice-broadcast/hooks/useVoiceBroadcastPlayback.ts
+index 7ed2b5682f..9acac4fbc0 100644
+--- a/src/voice-broadcast/hooks/useVoiceBroadcastPlayback.ts
++++ b/src/voice-broadcast/hooks/useVoiceBroadcastPlayback.ts
+@@ -58,7 +58,7 @@ export const useVoiceBroadcastPlayback = (playback: VoiceBroadcastPlayback) => {
+     );
+ 
+     return {
+-        length,
++        duration: Math.round(length / 1000),
+         live: playbackInfoState !== VoiceBroadcastInfoState.Stopped,
+         room: room,
+         sender: playback.infoEvent.sender,
+diff --git a/src/voice-broadcast/index.ts b/src/voice-broadcast/index.ts
+index c484f7af26..bc63f4358c 100644
+--- a/src/voice-broadcast/index.ts
++++ b/src/voice-broadcast/index.ts
+@@ -32,6 +32,7 @@ export * from "./components/molecules/VoiceBroadcastPlaybackBody";
+ export * from "./components/molecules/VoiceBroadcastRecordingBody";
+ export * from "./components/molecules/VoiceBroadcastRecordingPip";
+ export * from "./hooks/useVoiceBroadcastRecording";
++export * from "./hooks/useVoiceBroadcastPlayback";
+ export * from "./stores/VoiceBroadcastPlaybacksStore";
+ export * from "./stores/VoiceBroadcastRecordingsStore";
+ export * from "./utils/getChunkLength";
+diff --git a/src/voice-broadcast/models/VoiceBroadcastPlayback.ts b/src/voice-broadcast/models/VoiceBroadcastPlayback.ts
+index a3834a7e79..72a40c9317 100644
+--- a/src/voice-broadcast/models/VoiceBroadcastPlayback.ts
++++ b/src/voice-broadcast/models/VoiceBroadcastPlayback.ts
+@@ -21,9 +21,10 @@ import {
+     MsgType,
+     RelationType,
+ } from "matrix-js-sdk/src/matrix";
++import { SimpleObservable } from "matrix-widget-api";
+ import { TypedEventEmitter } from "matrix-js-sdk/src/models/typed-event-emitter";
+ 
+-import { Playback, PlaybackState } from "../../audio/Playback";
++import { Playback, PlaybackInterface, PlaybackState } from "../../audio/Playback";
+ import { PlaybackManager } from "../../audio/PlaybackManager";
+ import { UPDATE_EVENT } from "../../stores/AsyncStore";
+ import { MediaEventHelper } from "../../utils/MediaEventHelper";
+@@ -44,6 +45,7 @@ export enum VoiceBroadcastPlaybackEvent {
+     LengthChanged = "length_changed",
+     StateChanged = "state_changed",
+     InfoStateChanged = "info_state_changed",
++    PositionChanged = "position_changed",
+ }
+ 
+ interface EventMap {
+@@ -53,11 +55,12 @@ interface EventMap {
+         playback: VoiceBroadcastPlayback
+     ) => void;
+     [VoiceBroadcastPlaybackEvent.InfoStateChanged]: (state: VoiceBroadcastInfoState) => void;
++    [VoiceBroadcastPlaybackEvent.PositionChanged]: (position: number) => void;
+ }
+ 
+ export class VoiceBroadcastPlayback
+     extends TypedEventEmitter<VoiceBroadcastPlaybackEvent, EventMap>
+-    implements IDestroyable {
++    implements IDestroyable, PlaybackInterface {
+     private state = VoiceBroadcastPlaybackState.Stopped;
+     private infoState: VoiceBroadcastInfoState;
+     private chunkEvents = new VoiceBroadcastChunkEvents();
+@@ -66,6 +69,13 @@ export class VoiceBroadcastPlayback
+     private lastInfoEvent: MatrixEvent;
+     private chunkRelationHelper: RelationsHelper;
+     private infoRelationHelper: RelationsHelper;
++    
++    // Track position and duration internally in milliseconds
++    private positionMs = 0;
++    private durationMs = 0;
++    
++    // Observable for live data
++    private liveDataObservable = new SimpleObservable<number[]>();
+ 
+     public constructor(
+         public readonly infoEvent: MatrixEvent,
+@@ -76,6 +86,31 @@ export class VoiceBroadcastPlayback
+         this.setUpRelationsHelper();
+     }
+ 
++    public get liveData(): SimpleObservable<number[]> {
++        return this.liveDataObservable;
++    }
++
++    /**
++     * Returns the playback state of the player (always returns PlaybackState.Playing in this implementation).
++     */
++    public get currentState(): PlaybackState {
++        return PlaybackState.Playing;
++    }
++
++    /**
++     * Returns the current playback position in seconds.
++     */
++    public get timeSeconds(): number {
++        return this.positionMs / 1000;
++    }
++
++    /**
++     * Returns the total duration of the playback in seconds.
++     */
++    public get durationSeconds(): number {
++        return this.durationMs / 1000;
++    }
++
+     private setUpRelationsHelper(): void {
+         this.infoRelationHelper = new RelationsHelper(
+             this.infoEvent,
+@@ -107,7 +142,11 @@ export class VoiceBroadcastPlayback
+         }
+ 
+         this.chunkEvents.addEvent(event);
+-        this.emit(VoiceBroadcastPlaybackEvent.LengthChanged, this.chunkEvents.getLength());
++        
++        // Immediately recompute and set the duration from the chunk events' total length
++        this.durationMs = this.chunkEvents.getLength();
++        this.updateLiveData();
++        this.emit(VoiceBroadcastPlaybackEvent.LengthChanged, this.durationMs);
+ 
+         if (this.getState() !== VoiceBroadcastPlaybackState.Stopped) {
+             await this.enqueueChunk(event);
+@@ -146,6 +185,10 @@ export class VoiceBroadcastPlayback
+         }
+ 
+         this.chunkEvents.addEvents(chunkEvents);
++        
++        // Immediately set the duration from the chunk events' total length
++        this.durationMs = this.chunkEvents.getLength();
++        this.updateLiveData();
+ 
+         for (const chunkEvent of chunkEvents) {
+             await this.enqueueChunk(chunkEvent);
+@@ -164,6 +207,27 @@ export class VoiceBroadcastPlayback
+         playback.clockInfo.populatePlaceholdersFrom(chunkEvent);
+         this.playbacks.set(chunkEvent.getId(), playback);
+         playback.on(UPDATE_EVENT, (state) => this.onPlaybackStateChange(playback, state));
++        
++        // Attach an onUpdate listener to the underlying chunk Playback.clockInfo.liveData
++        // This listener will translate per-chunk offset into a broadcast-wide position
++        const chunkEventId = chunkEvent.getId();
++        playback.clockInfo.liveData.onUpdate((data: number[]) => {
++            // Only process updates from the currently playing chunk
++            if (this.currentlyPlaying?.getId() !== chunkEventId) {
++                return;
++            }
++            
++            const chunkPositionMs = data[0] * 1000; // Convert seconds to milliseconds
++            const offsetMs = this.chunkEvents.getLengthTo(chunkEvent);
++            const newBroadcastPositionMs = offsetMs + chunkPositionMs;
++            
++            // Only emit if the position actually changed
++            if (newBroadcastPositionMs !== this.positionMs) {
++                this.positionMs = newBroadcastPositionMs;
++                this.emit(VoiceBroadcastPlaybackEvent.PositionChanged, this.positionMs);
++                this.updateLiveData();
++            }
++        });
+     }
+ 
+     private async onPlaybackStateChange(playback: Playback, newState: PlaybackState) {
+@@ -194,15 +258,80 @@ export class VoiceBroadcastPlayback
+         }
+     }
+ 
++    private updateLiveData(): void {
++        const newLiveData: number[] = [this.timeSeconds, this.durationSeconds];
++        this.liveDataObservable.update(newLiveData);
++    }
++
+     public getLength(): number {
+         return this.chunkEvents.getLength();
+     }
+ 
++    /**
++     * Seeks the playback to the specified time in seconds.
++     */
++    public async skipTo(timeSeconds: number): Promise<void> {
++        if (this.chunkEvents.getEvents().length === 0) {
++            return;
++        }
++
++        const timeMs = timeSeconds * 1000;
++        this.positionMs = timeMs;
++
++        // Find the chunk that corresponds to this time
++        const targetChunkEvent = this.chunkEvents.findByTime(timeMs);
++        if (!targetChunkEvent) {
++            return;
++        }
++
++        const targetChunkId = targetChunkEvent.getId();
++        const currentChunkId = this.currentlyPlaying?.getId();
++
++        // If we're already on the correct chunk, just skip within it
++        if (currentChunkId === targetChunkId) {
++            // Calculate the position within the chunk
++            const chunkOffsetMs = this.chunkEvents.getLengthTo(targetChunkEvent);
++            const positionInChunkMs = timeMs - chunkOffsetMs;
++            const positionInChunkSeconds = positionInChunkMs / 1000;
++            
++            await this.playbacks.get(targetChunkId)?.skipTo(positionInChunkSeconds);
++            this.emit(VoiceBroadcastPlaybackEvent.PositionChanged, this.positionMs);
++            this.updateLiveData();
++            return;
++        }
++
++        // We need to switch to a different chunk
++        // Stop the currently playing chunk first
++        if (this.currentlyPlaying) {
++            this.playbacks.get(this.currentlyPlaying.getId())?.stop();
++        }
++
++        // Set the new current chunk
++        this.currentlyPlaying = targetChunkEvent;
++        this.setState(VoiceBroadcastPlaybackState.Playing);
++
++        // Calculate the position within the target chunk
++        const chunkOffsetMs = this.chunkEvents.getLengthTo(targetChunkEvent);
++        const positionInChunkMs = timeMs - chunkOffsetMs;
++        const positionInChunkSeconds = positionInChunkMs / 1000;
++
++        // Play the target chunk at the correct position
++        await this.playbacks.get(targetChunkId)?.skipTo(positionInChunkSeconds);
++        await this.playbacks.get(targetChunkId)?.play();
++        
++        this.emit(VoiceBroadcastPlaybackEvent.PositionChanged, this.positionMs);
++        this.updateLiveData();
++    }
++
+     public async start(): Promise<void> {
+         if (this.playbacks.size === 0) {
+             await this.loadChunks();
+         }
+ 
++        // Reset position when starting fresh
++        this.positionMs = 0;
++        this.updateLiveData();
++
+         const chunkEvents = this.chunkEvents.getEvents();
+ 
+         const toPlay = this.getInfoState() === VoiceBroadcastInfoState.Stopped
+@@ -225,6 +354,8 @@ export class VoiceBroadcastPlayback
+ 
+     public stop(): void {
+         this.setState(VoiceBroadcastPlaybackState.Stopped);
++        this.positionMs = 0;
++        this.updateLiveData();
+ 
+         if (this.currentlyPlaying) {
+             this.playbacks.get(this.currentlyPlaying.getId()).stop();
+@@ -302,6 +433,8 @@ export class VoiceBroadcastPlayback
+         this.infoRelationHelper.destroy();
+         this.removeAllListeners();
+ 
++        this.liveDataObservable.close();
++
+         this.chunkEvents = new VoiceBroadcastChunkEvents();
+         this.playbacks.forEach(p => p.destroy());
+         this.playbacks = new Map<string, Playback>();
+diff --git a/src/voice-broadcast/utils/VoiceBroadcastChunkEvents.ts b/src/voice-broadcast/utils/VoiceBroadcastChunkEvents.ts
+index ac7e90361d..d7b0f78868 100644
+--- a/src/voice-broadcast/utils/VoiceBroadcastChunkEvents.ts
++++ b/src/voice-broadcast/utils/VoiceBroadcastChunkEvents.ts
+@@ -59,6 +59,48 @@ export class VoiceBroadcastChunkEvents {
+         }, 0);
+     }
+ 
++    /**
++     * Returns the accumulated length (in milliseconds) up to but not including the given chunk event.
++     * Returns 0 for the first chunk, or the sum of all prior chunk durations for later chunks.
++     */
++    public getLengthTo(event: MatrixEvent): number {
++        const index = this.events.indexOf(event);
++        if (index < 0) {
++            return 0;
++        }
++
++        return this.events.slice(0, index).reduce((length: number, e: MatrixEvent) => {
++            return length + this.calculateChunkLength(e);
++        }, 0);
++    }
++
++    /**
++     * Finds and returns the chunk event corresponding to a given playback time.
++     * Returns the chunk whose cumulative-length-so-far is greater than OR EQUAL TO the queried time.
++     * If the time equals or exceeds the total duration, returns the last chunk.
++     * Returns null if no chunks exist.
++     */
++    public findByTime(time: number): MatrixEvent | null {
++        if (this.events.length === 0) {
++            return null;
++        }
++
++        let cumulativeLength = 0;
++        for (let i = 0; i < this.events.length; i++) {
++            const event = this.events[i];
++            const chunkLength = this.calculateChunkLength(event);
++            cumulativeLength += chunkLength;
++
++            // Return the chunk whose cumulative length is >= time (inclusive at boundary)
++            if (cumulativeLength >= time) {
++                return event;
++            }
++        }
++
++        // If time exceeds all chunks, return the last chunk
++        return this.events[this.events.length - 1];
++    }
++
+     private calculateChunkLength(event: MatrixEvent): number {
+         return event.getContent()?.["org.matrix.msc1767.audio"]?.duration
+             || event.getContent()?.info?.duration

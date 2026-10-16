@@ -1,0 +1,75 @@
+diff --git a/core/artwork/artwork.go b/core/artwork/artwork.go
+index c1c6ac2b..51c2973e 100644
+--- a/core/artwork/artwork.go
++++ b/core/artwork/artwork.go
+@@ -7,6 +7,7 @@ import (
+ 	"io"
+ 	"time"
+ 
++	"github.com/go-chi/jwtauth/v5"
+ 	"github.com/navidrome/navidrome/core/auth"
+ 	"github.com/navidrome/navidrome/core/ffmpeg"
+ 	"github.com/navidrome/navidrome/log"
+@@ -82,7 +83,7 @@ func (a *artwork) getArtworkId(ctx context.Context, id string) (model.ArtworkID,
+ 		log.Trace(ctx, "ID is for a MediaFile", "id", id, "title", e.Title, "album", e.Album)
+ 	case *model.Playlist:
+ 		artID = model.NewArtworkID(model.KindPlaylistArtwork, e.ID)
+-		log.Trace(ctx, "ID is for a Playlist", "id", id, "name", e.Name)
++		log.Trace(ctx, "ID is for an Playlist", "id", id, "name", e.Name)
+ 	}
+ 	return artID, nil
+ }
+@@ -109,6 +110,53 @@ func (a *artwork) getArtworkReader(ctx context.Context, artID model.ArtworkID, s
+ 	return artReader, err
+ }
+ 
++// EncodeArtworkID encodes an artwork identifier into a public token string
++// containing only the artwork ID claim, so public image URLs no longer
++// include size information in the token.
++func EncodeArtworkID(artID model.ArtworkID) string {
++	token, _ := auth.CreatePublicToken(map[string]any{
++		"id": artID.String(),
++	})
++	return token
++}
++
++// DecodeArtworkID decodes a public artwork token, requires an `id` claim,
++// verifies that the claim is a string, and parses it into a model.ArtworkID.
++// Returns an error when the token is invalid, unauthorized, missing the
++// required claim, has an invalid ID type, or contains an invalid artwork ID.
++func DecodeArtworkID(tokenString string) (model.ArtworkID, error) {
++	if tokenString == "" {
++		return model.ArtworkID{}, errors.New("invalid JWT")
++	}
++
++	token, err := jwtauth.VerifyToken(auth.TokenAuth, tokenString)
++	if err != nil {
++		return model.ArtworkID{}, errors.New("invalid JWT")
++	}
++
++	claims, err := token.AsMap(context.Background())
++	if err != nil {
++		return model.ArtworkID{}, errors.New("invalid JWT")
++	}
++
++	idClaim, ok := claims["id"]
++	if !ok {
++		return model.ArtworkID{}, errors.New("invalid artwork id")
++	}
++
++	idStr, ok := idClaim.(string)
++	if !ok {
++		return model.ArtworkID{}, errors.New("invalid artwork id")
++	}
++
++	artID, err := model.ParseArtworkID(idStr)
++	if err != nil {
++		return model.ArtworkID{}, errors.New("invalid artwork id")
++	}
++
++	return artID, nil
++}
++
+ func PublicLink(artID model.ArtworkID, size int) string {
+ 	token, _ := auth.CreatePublicToken(map[string]any{
+ 		"id":   artID.String(),

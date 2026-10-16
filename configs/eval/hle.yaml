@@ -1,0 +1,18 @@
+# HLE — fixed for every evaluated model. Frozen before evaluation.
+dataset: cais/hle@5a81a4c7271a2a2a312b9a690f0c2fde837e4c29   # split test, 2500 questions
+images: included (342 image questions sent as data URLs; model is natively multimodal)
+tools: none
+prompts: official HLE system prompts (exactMatch / multipleChoice)
+thinking: enabled
+sampling: {temperature: 1.0, top_p: 0.95, top_k: 20, presence_penalty: 1.5}   # model-card thinking, general
+max_tokens: 8192           # budget cap (time/compute), same for every model; NOT the model-card setting
+seed: 0
+serving: Modal 2x H100-80GB, vLLM 0.30.0 bf16 TP=2 (same image/flags as local), identical for all models
+concurrency: 256           # same for all models; earlier partial local A6000 runs archived as pilots, not reported
+judge: OpenAI o3-mini-2025-01-31 with the official HLE judge prompt (structured output)
+metric: accuracy (%) over all 2500; text-only subset reported separately, never mixed
+budget_forcing:            # added after the base run showed 83% of responses hit the 8K budget without an answer
+  method: Qwen thinking-budget recipe - close <think> with the early-stop sentence, continue up to 1024 tokens
+  early_stop: "Considering the limited time by the user, I have to give the solution based on the thinking directly now."
+  applies_to: responses with finish_reason == length (identical rule for every model)
+primary_metric: accuracy of the budget-forced run (run1_bf); the plain truncated run (run1) is reported alongside

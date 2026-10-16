@@ -1,0 +1,452 @@
+diff --git a/applications/mail/src/app/hooks/useApplyLabels.tsx b/applications/mail/src/app/hooks/useApplyLabels.tsx
+index 3c7a1e2c9..359f587f9 100644
+--- a/applications/mail/src/app/hooks/useApplyLabels.tsx
++++ b/applications/mail/src/app/hooks/useApplyLabels.tsx
+@@ -1,4 +1,5 @@
+ import { useCallback } from 'react';
++import { useDispatch } from 'react-redux';
+ import { c, msgid } from 'ttag';
+ import { useApi, useNotifications, useEventManager, useLabels, useModals, ConfirmModal } from '@proton/components';
+ import { labelMessages, unlabelMessages } from '@proton/shared/lib/api/messages';
+@@ -12,6 +13,7 @@ import { isMessage as testIsMessage } from '../helpers/elements';
+ import { getMessagesAuthorizedToMove } from '../helpers/message/messages';
+ import { Element } from '../models/element';
+ import { useOptimisticApplyLabels } from './optimistic/useOptimisticApplyLabels';
++import { backendActionStarted, backendActionFinished } from '../logic/elements/elementsActions';
+ import { SUCCESS_NOTIFICATION_EXPIRATION } from '../constants';
+ import { Conversation } from '../models/conversation';
+ 
+@@ -271,6 +273,7 @@ export const useApplyLabels = () => {
+ };
+ 
+ export const useMoveToFolder = () => {
++    const dispatch = useDispatch();
+     const api = useApi();
+     const { call, stop, start } = useEventManager();
+     const { createNotification } = useNotifications();
+@@ -379,6 +382,7 @@ export const useMoveToFolder = () => {
+             const rollback = optimisticApplyLabels(authorizedToMove, { [folderID]: true }, true, [], fromLabelID);
+ 
+             const handleDo = async () => {
++                dispatch(backendActionStarted());
+                 let token;
+                 try {
+                     // Stop the event manager to prevent race conditions
+@@ -394,6 +398,7 @@ export const useMoveToFolder = () => {
+                         await call();
+                     }
+                 }
++                dispatch(backendActionFinished());
+                 return token;
+             };
+ 
+@@ -441,6 +446,7 @@ export const useMoveToFolder = () => {
+ };
+ 
+ export const useStar = () => {
++    const dispatch = useDispatch();
+     const api = useApi();
+     const { call, stop, start } = useEventManager();
+     const optimisticApplyLabels = useOptimisticApplyLabels();
+@@ -460,7 +466,9 @@ export const useStar = () => {
+         try {
+             // Stop the event manager to prevent race conditions
+             stop();
++            dispatch(backendActionStarted());
+             await api(action({ LabelID: MAILBOX_LABEL_IDS.STARRED, IDs: elements.map((element) => element.ID) }));
++            dispatch(backendActionFinished());
+         } catch (error: any) {
+             rollback();
+             throw error;
+diff --git a/applications/mail/src/app/hooks/useEmptyLabel.tsx b/applications/mail/src/app/hooks/useEmptyLabel.tsx
+index 1a58f9f00..b84e9c266 100644
+--- a/applications/mail/src/app/hooks/useEmptyLabel.tsx
++++ b/applications/mail/src/app/hooks/useEmptyLabel.tsx
+@@ -1,4 +1,5 @@
+ import { useCallback } from 'react';
++import { useDispatch } from 'react-redux';
+ import { c } from 'ttag';
+ import {
+     ConfirmModal,
+@@ -15,8 +16,10 @@ import { emptyLabel as emptyLabelRequest } from '@proton/shared/lib/api/messages
+ 
+ import { useOptimisticEmptyLabel } from './optimistic/useOptimisticEmptyLabel';
+ import { isCustomLabel } from '../helpers/labels';
++import { backendActionStarted, backendActionFinished } from '../logic/elements/elementsActions';
+ 
+ export const useEmptyLabel = () => {
++    const dispatch = useDispatch();
+     const { createNotification } = useNotifications();
+     const { createModal } = useModals();
+     const { call } = useEventManager();
+@@ -55,7 +58,9 @@ export const useEmptyLabel = () => {
+             });
+             const rollback = optimisticEmptyLabel(labelID);
+             try {
++                dispatch(backendActionStarted());
+                 await api(emptyLabelRequest({ LabelID: labelID, AddressID: undefined }));
++                dispatch(backendActionFinished());
+             } catch (error: any) {
+                 rollback();
+                 throw error;
+diff --git a/applications/mail/src/app/hooks/useMarkAs.tsx b/applications/mail/src/app/hooks/useMarkAs.tsx
+index 76968f02c..3144e8728 100644
+--- a/applications/mail/src/app/hooks/useMarkAs.tsx
++++ b/applications/mail/src/app/hooks/useMarkAs.tsx
+@@ -7,6 +7,7 @@ import { undoActions } from '@proton/shared/lib/api/mailUndoActions';
+ import { isMessage as testIsMessage } from '../helpers/elements';
+ import { Element } from '../models/element';
+ import UndoActionNotification from '../components/notifications/UndoActionNotification';
++import { backendActionStarted, backendActionFinished } from '../logic/elements/elementsActions';
+ import { useOptimisticMarkAs } from './optimistic/useOptimisticMarkAs';
+ import { SUCCESS_NOTIFICATION_EXPIRATION } from '../constants';
+ 
+@@ -56,6 +57,7 @@ const getNotificationTextMarked = (isMessage: boolean, elementsCount: number, st
+ };
+ 
+ export const useMarkAs = () => {
++    const dispatch = useDispatch();
+     const api = useApi();
+     const { call, start, stop } = useEventManager();
+     const optimisticMarkAs = useOptimisticMarkAs();
+@@ -77,6 +79,7 @@ export const useMarkAs = () => {
+             try {
+                 // Stop the event manager to prevent race conditions
+                 stop();
++                dispatch(backendActionStarted());
+                 const { UndoToken } = await api(
+                     action(
+                         elements.map((element) => element.ID),
+@@ -84,6 +87,7 @@ export const useMarkAs = () => {
+                     )
+                 );
+                 token = UndoToken.Token;
++                dispatch(backendActionFinished());
+             } catch (error: any) {
+                 rollback();
+                 throw error;
+diff --git a/applications/mail/src/app/hooks/usePermanentDelete.tsx b/applications/mail/src/app/hooks/usePermanentDelete.tsx
+index 887bd56a6..c6f7d503a 100644
+--- a/applications/mail/src/app/hooks/usePermanentDelete.tsx
++++ b/applications/mail/src/app/hooks/usePermanentDelete.tsx
+@@ -1,4 +1,5 @@
+ import { c, msgid } from 'ttag';
++import { useDispatch } from 'react-redux';
+ import {
+     Alert,
+     ConfirmModal,
+@@ -14,6 +15,7 @@ import { MAILBOX_LABEL_IDS } from '@proton/shared/lib/constants';
+ import { useGetElementsFromIDs } from './mailbox/useElements';
+ import { isConversation } from '../helpers/elements';
+ import useOptimisticDelete from './optimistic/useOptimisticDelete';
++import { backendActionStarted, backendActionFinished } from '../logic/elements/elementsActions';
+ 
+ const { DRAFTS, ALL_DRAFTS } = MAILBOX_LABEL_IDS;
+ 
+@@ -133,6 +135,7 @@ export const getNotificationText = (
+ };
+ 
+ export const usePermanentDelete = (labelID: string) => {
++    const dispatch = useDispatch();
+     const { createNotification } = useNotifications();
+     const { createModal } = useModals();
+     const { call } = useEventManager();
+@@ -169,8 +172,10 @@ export const usePermanentDelete = (labelID: string) => {
+         });
+         const rollback = optimisticDelete(elements, labelID);
+         try {
++            dispatch(backendActionStarted());
+             const action = conversationMode ? deleteConversations(selectedIDs, labelID) : deleteMessages(selectedIDs);
+             await api(action);
++            dispatch(backendActionFinished());
+             await call();
+             const notificationText = getNotificationText(draft, conversationMode, selectedItemsCount, totalMessages);
+             createNotification({ text: notificationText });
+diff --git a/applications/mail/src/app/logic/elements/elementsActions.ts b/applications/mail/src/app/logic/elements/elementsActions.ts
+index d552b139d..ccbfd9b08 100644
+--- a/applications/mail/src/app/logic/elements/elementsActions.ts
++++ b/applications/mail/src/app/logic/elements/elementsActions.ts
+@@ -20,19 +20,53 @@ export const updatePage = createAction<number>('elements/updatePage');
+ 
+ export const retry = createAction<RetryData>('elements/retry');
+ 
++/**
++ * The main load async thunk that fetches elements from the API.
++ * Handles failures with a 2-second retry delay and stale responses with a 1-second retry delay.
++ */
+ export const load = createAsyncThunk<QueryResults, QueryParams>(
+     'elements/load',
+     async (queryParams: QueryParams, { getState, dispatch }) => {
+         const queryParameters = getQueryElementsParameters(queryParams);
+         try {
+-            return await queryElements(
++            const result = await queryElements(
+                 queryParams.api,
+                 queryParams.abortController,
+                 queryParams.conversationMode,
+                 queryParameters
+             );
++
++            // Check if the response is stale (Stale === 1)
++            // Cast to any to access the Stale property that may be added by the API
++            const response = result as any;
++            if (response.Stale === 1) {
++                // Don't commit this response - keep the request marked as in flight
++                // Wait 1 second before issuing a new fetch
++                setTimeout(() => {
++                    // Issue the fetch directly and commit its result with no further timer or deferral
++                    dispatch(
++                        load({
++                            api: queryParams.api,
++                            abortController: new AbortController(),
++                            conversationMode: queryParams.conversationMode,
++                            page: queryParams.page,
++                            params: queryParams.params,
++                        })
++                    );
++                }, 1000);
++                // Throw to prevent the fulfilled reducer from running
++                // pendingRequest remains true, so the list continues showing placeholders
++                throw new Error('Stale response');
++            }
++
++            return result;
+         } catch (error: any | undefined) {
+-            // Wait a couple of seconds before retrying
++            // Check if this was a stale error (already handled above)
++            if (error?.message === 'Stale response') {
++                throw error;
++            }
++
++            // Wait a couple of seconds before retrying on failure
+             setTimeout(() => {
+                 const currentRetry = (getState() as RootState).elements.retry;
+                 dispatch(retry(newRetry(currentRetry, queryParameters, error)));
+@@ -70,3 +104,21 @@ export const optimisticEmptyLabel = createAction<void>('elements/optimistic/empt
+ export const optimisticRestoreEmptyLabel = createAction<OptimisticUpdates>('elements/optimistic/restoreEmptyLabel');
+ 
+ export const optimisticMarkAs = createAction<OptimisticUpdates>('elements/optimistic/markAs');
++
++/**
++ * Action creator that reports a stale element list response,
++ * carrying the query parameters the next fetch is issued with.
++ */
++export const retryStale = createAction<{ queryParameters: any }>('elements/retryStale');
++
++/**
++ * Action creator that reports that an operation modifying items in the list has started,
++ * so list refreshes are held back while it runs.
++ */
++export const backendActionStarted = createAction<void>('elements/backendActionStarted');
++
++/**
++ * Action creator that reports that an operation modifying items in the list has settled,
++ * so a held-back refresh may be carried out once none remains.
++ */
++export const backendActionFinished = createAction<void>('elements/backendActionFinished');
+diff --git a/applications/mail/src/app/logic/elements/elementsReducers.ts b/applications/mail/src/app/logic/elements/elementsReducers.ts
+index e8f0749ee..d0ed0a2d3 100644
+--- a/applications/mail/src/app/logic/elements/elementsReducers.ts
++++ b/applications/mail/src/app/logic/elements/elementsReducers.ts
+@@ -161,3 +161,48 @@ export const optimisticEmptyLabel = (state: Draft<ElementsState>) => {
+     state.elements = {};
+     state.page = 0;
+ };
++
++/**
++ * Reducer that records a stale response as a fetch that is still owed,
++ * so the list stops treating the request as in flight and keeps showing
++ * its placeholders until a further fetch returns a usable result.
++ *
++ * Note: The load thunk handles stale responses internally by:
++ * 1. Keeping pendingRequest = true during the 1-second delay
++ * 2. Dispatching a new load after 1 second
++ * This reducer is provided for external use cases if needed.
++ */
++export const retryStale = (state: Draft<ElementsState>, action: PayloadAction<{ queryParameters: any }>) => {
++    // Mark as not pending and owed for refresh
++    // Note: In the load thunk, stale responses are handled internally
++    // without dispatching this action, so pendingRequest stays true
++    // This reducer is here for external stale handling if needed
++    state.pendingRequest = false;
++    state.invalidated = false;
++    state.refreshOwed = true;
++};
++
++/**
++ * Reducer that records one more operation modifying items in the list as in progress.
++ */
++export const backendActionStarted = (state: Draft<ElementsState>) => {
++    state.pendingActions += 1;
++};
++
++/**
++ * Reducer that records one fewer operation modifying items in the list as in progress.
++ * If this was the last operation, issue any held-back refresh synchronously.
++ */
++export const backendActionFinished = (state: Draft<ElementsState>, action: PayloadAction<void>) => {
++    state.pendingActions -= 1;
++    // When the last in-progress operation settles, issue any held-back fetch synchronously
++    if (state.pendingActions <= 0 && state.refreshOwed) {
++        state.refreshOwed = false;
++        state.invalidated = true;
++        state.retry = {
++            payload: undefined,
++            count: 0,
++            error: undefined,
++        };
++    }
++};
+diff --git a/applications/mail/src/app/logic/elements/elementsSelectors.ts b/applications/mail/src/app/logic/elements/elementsSelectors.ts
+index 6603c0964..2c406ef00 100644
+--- a/applications/mail/src/app/logic/elements/elementsSelectors.ts
++++ b/applications/mail/src/app/logic/elements/elementsSelectors.ts
+@@ -25,6 +25,8 @@ const pendingRequest = (state: RootState) => state.elements.pendingRequest;
+ const retry = (state: RootState) => state.elements.retry;
+ const invalidated = (state: RootState) => state.elements.invalidated;
+ const total = (state: RootState) => state.elements.total;
++const pendingActions = (state: RootState) => state.elements.pendingActions;
++const refreshOwed = (state: RootState) => state.elements.refreshOwed;
+ 
+ const currentPage = (_: RootState, { page }: { page: number }) => page;
+ const currentSearch = (_: RootState, { search }: { search: SearchParameters }) => search;
+@@ -111,13 +113,17 @@ export const shouldResetCache = createSelector(
+ );
+ 
+ export const shouldSendRequest = createSelector(
+-    [shouldResetCache, pendingRequest, retry, needsMoreElements, invalidated, pageCached],
+-    (shouldResetCache, pendingRequest, retry, needsMoreElements, invalidated, pageCached) => {
++    [shouldResetCache, pendingRequest, retry, needsMoreElements, invalidated, pageCached, pendingActions, refreshOwed],
++    (shouldResetCache, pendingRequest, retry, needsMoreElements, invalidated, pageCached, pendingActions, refreshOwed) => {
++        // Do not issue a fetch if there are backend actions in progress
++        if (pendingActions > 0) {
++            return false;
++        }
+         return (
+             shouldResetCache ||
+             (!pendingRequest &&
+                 retry.count < MAX_ELEMENT_LIST_LOAD_RETRIES &&
+-                (needsMoreElements || invalidated || !pageCached))
++                (needsMoreElements || invalidated || refreshOwed || !pageCached))
+         );
+     }
+ );
+@@ -182,8 +188,8 @@ export const placeholderCount = createSelector(
+ );
+ 
+ export const loading = createSelector(
+-    [beforeFirstLoad, pendingRequest, invalidated],
+-    (beforeFirstLoad, pendingRequest, invalidated) => (beforeFirstLoad || pendingRequest) && !invalidated
++    [beforeFirstLoad, pendingRequest, invalidated, refreshOwed],
++    (beforeFirstLoad, pendingRequest, invalidated, refreshOwed) => (beforeFirstLoad || pendingRequest || refreshOwed) && !invalidated
+ );
+ 
+ export const totalReturned = createSelector([dynamicTotal, total], (dynamicTotal, total) => dynamicTotal || total);
+@@ -205,3 +211,8 @@ export const stateInconsistency = createSelector(
+     (beforeFirstLoad, pendingRequest, retry, useES) =>
+         !beforeFirstLoad && !pendingRequest && retry.error === undefined && retry.count === 3 && !useES
+ );
++
++/**
++ * Selector that reports how many operations modifying items in the list are still in progress.
++ */
++export const pendingActionsSelector = (state: RootState) => state.elements.pendingActions;
+diff --git a/applications/mail/src/app/logic/elements/elementsSlice.ts b/applications/mail/src/app/logic/elements/elementsSlice.ts
+index 49e1a7fd3..814a16f33 100644
+--- a/applications/mail/src/app/logic/elements/elementsSlice.ts
++++ b/applications/mail/src/app/logic/elements/elementsSlice.ts
+@@ -17,6 +17,9 @@ import {
+     optimisticEmptyLabel,
+     optimisticRestoreEmptyLabel,
+     optimisticMarkAs,
++    retryStale as retryStaleAction,
++    backendActionStarted as backendActionStartedAction,
++    backendActionFinished as backendActionFinishedAction,
+ } from './elementsActions';
+ import {
+     globalReset as globalResetReducer,
+@@ -34,6 +37,9 @@ import {
+     optimisticUpdates,
+     optimisticDelete as optimisticDeleteReducer,
+     optimisticEmptyLabel as optimisticEmptyLabelReducer,
++    retryStale as retryStaleReducer,
++    backendActionStarted as backendActionStartedReducer,
++    backendActionFinished as backendActionFinishedReducer,
+ } from './elementsReducers';
+ import { globalReset } from '../actions';
+ 
+@@ -62,6 +68,8 @@ export const newState = ({
+         pages: [],
+         bypassFilter: [],
+         retry,
++        pendingActions: 0,
++        refreshOwed: false,
+     };
+ };
+ 
+@@ -91,6 +99,10 @@ const elementsSlice = createSlice({
+         builder.addCase(optimisticEmptyLabel, optimisticEmptyLabelReducer);
+         builder.addCase(optimisticRestoreEmptyLabel, optimisticUpdates);
+         builder.addCase(optimisticMarkAs, optimisticUpdates);
++
++        builder.addCase(retryStaleAction, retryStaleReducer);
++        builder.addCase(backendActionStartedAction, backendActionStartedReducer);
++        builder.addCase(backendActionFinishedAction, backendActionFinishedReducer);
+     },
+ });
+ 
+diff --git a/applications/mail/src/app/logic/elements/elementsTypes.ts b/applications/mail/src/app/logic/elements/elementsTypes.ts
+index 413454df3..171637e1a 100644
+--- a/applications/mail/src/app/logic/elements/elementsTypes.ts
++++ b/applications/mail/src/app/logic/elements/elementsTypes.ts
+@@ -73,6 +73,17 @@ export interface ElementsState {
+      * Keeps track of the last request to count the number of attemps
+      */
+     retry: RetryData;
++
++    /**
++     * Number of operations modifying items in the list that are currently in progress
++     */
++    pendingActions: number;
++
++    /**
++     * True when a refresh is owed but has not yet been issued
++     * (e.g. held back because backend actions are in progress)
++     */
++    refreshOwed: boolean;
+ }
+ 
+ export interface QueryParams {
+diff --git a/applications/mail/src/app/logic/elements/helpers/elementQuery.ts b/applications/mail/src/app/logic/elements/helpers/elementQuery.ts
+index 475332f96..10b4e7ca5 100644
+--- a/applications/mail/src/app/logic/elements/helpers/elementQuery.ts
++++ b/applications/mail/src/app/logic/elements/helpers/elementQuery.ts
+@@ -28,12 +28,19 @@ export const getQueryElementsParameters = ({ page, params: { labelID, sort, sear
+     AutoWildcard: search.wildcard,
+ });
+ 
++/**
++ * Extended QueryResults that includes the Stale flag from the API response
++ */
++export interface QueryResultsWithStale extends QueryResults {
++    Stale?: number;
++}
++
+ export const queryElements = async (
+     api: Api,
+     abortController: AbortController | undefined,
+     conversationMode: boolean,
+     payload: QueryParams
+-): Promise<QueryResults> => {
++): Promise<QueryResultsWithStale> => {
+     abortController?.abort();
+     const newAbortController = new AbortController();
+     const query = conversationMode ? queryConversations : queryMessageMetadata;
+@@ -44,6 +51,7 @@ export const queryElements = async (
+         abortController: newAbortController,
+         Total: result.Total,
+         Elements: conversationMode ? result.Conversations : result.Messages,
++        Stale: result.Stale,
+     };
+ };
+ 

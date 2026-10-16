@@ -1,0 +1,451 @@
+diff --git a/applications/mail/src/app/hooks/useApplyLabels.tsx b/applications/mail/src/app/hooks/useApplyLabels.tsx
+index 3c7a1e2c9..3cd496b88 100644
+--- a/applications/mail/src/app/hooks/useApplyLabels.tsx
++++ b/applications/mail/src/app/hooks/useApplyLabels.tsx
+@@ -1,4 +1,5 @@
+ import { useCallback } from 'react';
++import { useDispatch } from 'react-redux';
+ import { c, msgid } from 'ttag';
+ import { useApi, useNotifications, useEventManager, useLabels, useModals, ConfirmModal } from '@proton/components';
+ import { labelMessages, unlabelMessages } from '@proton/shared/lib/api/messages';
+@@ -14,6 +15,7 @@ import { Element } from '../models/element';
+ import { useOptimisticApplyLabels } from './optimistic/useOptimisticApplyLabels';
+ import { SUCCESS_NOTIFICATION_EXPIRATION } from '../constants';
+ import { Conversation } from '../models/conversation';
++import { backendActionStarted, backendActionFinished } from '../logic/elements/elementsActions';
+ 
+ const { SPAM, TRASH, SCHEDULED, SENT, ALL_SENT, DRAFTS, ALL_DRAFTS, INBOX } = MAILBOX_LABEL_IDS;
+ 
+@@ -175,6 +177,7 @@ const getNotificationTextMoved = (
+ };
+ 
+ export const useApplyLabels = () => {
++    const dispatch = useDispatch();
+     const api = useApi();
+     const { call, stop, start } = useEventManager();
+     const { createNotification } = useNotifications();
+@@ -201,6 +204,7 @@ export const useApplyLabels = () => {
+                 try {
+                     // Stop the event manager to prevent race conditions
+                     stop();
++                    dispatch(backendActionStarted());
+                     tokens = await Promise.all(
+                         changesKeys.map(async (LabelID) => {
+                             rollbacks[LabelID] = optimisticApplyLabels(elements, { [LabelID]: changes[LabelID] });
+@@ -215,6 +219,7 @@ export const useApplyLabels = () => {
+                         })
+                     );
+                 } finally {
++                    dispatch(backendActionFinished());
+                     if (!undoing) {
+                         start();
+                         await call();
+@@ -383,12 +388,14 @@ export const useMoveToFolder = () => {
+                 try {
+                     // Stop the event manager to prevent race conditions
+                     stop();
++                    dispatch(backendActionStarted());
+                     const { UndoToken } = await api(action({ LabelID: folderID, IDs: elementIDs }));
+                     // We are not checking ValidUntil since notification stay for few seconds after this action
+                     token = UndoToken.Token;
+                 } catch (error: any) {
+                     rollback();
+                 } finally {
++                    dispatch(backendActionFinished());
+                     if (!undoing) {
+                         start();
+                         await call();
+@@ -444,6 +451,7 @@ export const useStar = () => {
+     const api = useApi();
+     const { call, stop, start } = useEventManager();
+     const optimisticApplyLabels = useOptimisticApplyLabels();
++    const dispatch = useDispatch();
+ 
+     const star = useCallback(async (elements: Element[], value: boolean) => {
+         if (!elements.length) {
+@@ -460,11 +468,13 @@ export const useStar = () => {
+         try {
+             // Stop the event manager to prevent race conditions
+             stop();
++            dispatch(backendActionStarted());
+             await api(action({ LabelID: MAILBOX_LABEL_IDS.STARRED, IDs: elements.map((element) => element.ID) }));
+         } catch (error: any) {
+             rollback();
+             throw error;
+         } finally {
++            dispatch(backendActionFinished());
+             start();
+             await call();
+         }
+diff --git a/applications/mail/src/app/logic/elements/elementsActions.ts b/applications/mail/src/app/logic/elements/elementsActions.ts
+index d552b139d..8a3453c1c 100644
+--- a/applications/mail/src/app/logic/elements/elementsActions.ts
++++ b/applications/mail/src/app/logic/elements/elementsActions.ts
+@@ -1,4 +1,4 @@
+-import { createAction, createAsyncThunk } from '@reduxjs/toolkit';
++import { createAction, createAsyncThunk, PayloadAction, unwrapResult } from '@reduxjs/toolkit';
+ import { noop } from '@proton/shared/lib/helpers/function';
+ import {
+     ESResults,
+@@ -22,15 +22,16 @@ export const retry = createAction<RetryData>('elements/retry');
+ 
+ export const load = createAsyncThunk<QueryResults, QueryParams>(
+     'elements/load',
+-    async (queryParams: QueryParams, { getState, dispatch }) => {
++    async (queryParams: QueryParams, { getState, dispatch, rejectWithValue }) => {
+         const queryParameters = getQueryElementsParameters(queryParams);
+         try {
+-            return await queryElements(
++            const result = await queryElements(
+                 queryParams.api,
+                 queryParams.abortController,
+                 queryParams.conversationMode,
+                 queryParameters
+             );
++            return result;
+         } catch (error: any | undefined) {
+             // Wait a couple of seconds before retrying
+             setTimeout(() => {
+@@ -70,3 +71,21 @@ export const optimisticEmptyLabel = createAction<void>('elements/optimistic/empt
+ export const optimisticRestoreEmptyLabel = createAction<OptimisticUpdates>('elements/optimistic/restoreEmptyLabel');
+ 
+ export const optimisticMarkAs = createAction<OptimisticUpdates>('elements/optimistic/markAs');
++
++/**
++ * Action creator that reports a stale element list response,
++ * carrying the query parameters the next fetch is issued with.
++ */
++export const retryStale = createAction<{ queryParameters: any }>('elements/retryStale');
++
++/**
++ * Action creator that reports that an operation modifying items in the list has started,
++ * so list refreshes are held back while it runs.
++ */
++export const backendActionStarted = createAction<void>('elements/backendActionStarted');
++
++/**
++ * Action creator that reports that an operation modifying items in the list has settled,
++ * so a held-back refresh may be carried out once none remains.
++ */
++export const backendActionFinished = createAction<void>('elements/backendActionFinished');
+diff --git a/applications/mail/src/app/logic/elements/elementsMiddleware.ts b/applications/mail/src/app/logic/elements/elementsMiddleware.ts
+new file mode 100644
+index 000000000..592a64824
+--- /dev/null
++++ b/applications/mail/src/app/logic/elements/elementsMiddleware.ts
+@@ -0,0 +1,51 @@
++import { Middleware } from '@reduxjs/toolkit';
++import { load, retryStale as retryStaleAction, backendActionFinished } from './elementsActions';
++import { getQueryElementsParameters } from './helpers/elementQuery';
++
++const elementsMiddleware: Middleware = (store) => (next) => (action) => {
++    // Handle stale response - if the loadFulfilled action has a Stale property
++    if (
++        action.type === 'elements/load/fulfilled' &&
++        action.payload &&
++        (action.payload as any)?.Stale === 1
++    ) {
++        const queryParameters = getQueryElementsParameters((action.meta as any)?.arg);
++        // Dispatch retryStale action to schedule a retry after 1 second
++        store.dispatch(retryStaleAction({ queryParameters }));
++    }
++
++    // Handle backend action finished - if this is the last pending action, dispatch load if needed
++    if (action.type === backendActionFinished.type) {
++        const state = store.getState().elements;
++        
++        // Check if this was the last pending action
++        if (state.pendingActions === 0) {
++            // Get the current params to dispatch a load
++            const { params, page } = state;
++            // Check if we should reload (no pending request, not before first load)
++            if (!state.pendingRequest && !state.beforeFirstLoad) {
++                // Get api from the store's root state
++                const rootState = store.getState();
++                const api = (rootState as any)?.api;
++                if (api) {
++                    const abortController = new AbortController();
++                    // Use store.dispatch which should be typed to handle thunks
++                    const dispatch = store.dispatch as any;
++                    dispatch(
++                        load({
++                            api,
++                            abortController,
++                            conversationMode: params.conversationMode,
++                            page,
++                            params: params,
++                        })
++                    );
++                }
++            }
++        }
++    }
++
++    return next(action);
++};
++
++export default elementsMiddleware;
+diff --git a/applications/mail/src/app/logic/elements/elementsReducers.ts b/applications/mail/src/app/logic/elements/elementsReducers.ts
+index e8f0749ee..d0b4a00ff 100644
+--- a/applications/mail/src/app/logic/elements/elementsReducers.ts
++++ b/applications/mail/src/app/logic/elements/elementsReducers.ts
+@@ -1,6 +1,6 @@
+ import { toMap } from '@proton/shared/lib/helpers/object';
+ import { Draft } from 'immer';
+-import { PayloadAction } from '@reduxjs/toolkit';
++import { PayloadAction, createAction } from '@reduxjs/toolkit';
+ import isTruthy from '@proton/shared/lib/helpers/isTruthy';
+ import { diff, range } from '@proton/shared/lib/helpers/array';
+ import { Message } from '@proton/shared/lib/interfaces/mail/Message';
+@@ -55,6 +55,15 @@ export const loadFulfilled = (
+     const { page, params } = action.meta.arg;
+     const { Total, Elements } = action.payload;
+ 
++    // Check if the response is stale (Stale === 1)
++    const isStale = action.payload.Stale === 1;
++    if (isStale) {
++        // Don't commit stale response, but clear pending to allow retry
++        state.pendingRequest = false;
++        // State is left with stale data - caller should handle retry
++        return;
++    }
++
+     Object.assign(state, {
+         beforeFirstLoad: false,
+         invalidated: false,
+@@ -161,3 +170,43 @@ export const optimisticEmptyLabel = (state: Draft<ElementsState>) => {
+     state.elements = {};
+     state.page = 0;
+ };
++
++/**
++ * Reducer that records a stale response as a fetch that is still owed,
++ * so the list stops treating the request as in flight and keeps showing
++ * its placeholders until a further fetch returns a usable result.
++ */
++export const retryStale = (state: Draft<ElementsState>, action: PayloadAction<{ queryParameters: any }>) => {
++    const { queryParameters } = action.payload;
++
++    // Clear any existing stale retry timer
++    if (state.staleRetryTimer) {
++        clearTimeout(state.staleRetryTimer);
++        state.staleRetryTimer = null;
++    }
++
++    // Clear the pending request flag since the stale response should not keep it as pending
++    state.pendingRequest = false;
++
++    // Record the query parameters for the retry
++    state.staleRetryQueryParameters = queryParameters;
++};
++
++/**
++ * Reducer that records one more operation modifying items in the list as in progress.
++ */
++export const backendActionStarted = (state: Draft<ElementsState>) => {
++    state.pendingActions += 1;
++};
++
++/**
++ * Reducer that records one fewer operation modifying items in the list as in progress.
++ * When the last pending action settles, dispatches a fetch if one is owed.
++ */
++export const backendActionFinished = (state: Draft<ElementsState>) => {
++    if (state.pendingActions > 0) {
++        state.pendingActions -= 1;
++    }
++};
++
++
+diff --git a/applications/mail/src/app/logic/elements/elementsSelectors.ts b/applications/mail/src/app/logic/elements/elementsSelectors.ts
+index 6603c0964..27219e408 100644
+--- a/applications/mail/src/app/logic/elements/elementsSelectors.ts
++++ b/applications/mail/src/app/logic/elements/elementsSelectors.ts
+@@ -26,6 +26,13 @@ const retry = (state: RootState) => state.elements.retry;
+ const invalidated = (state: RootState) => state.elements.invalidated;
+ const total = (state: RootState) => state.elements.total;
+ 
++/**
++ * Selector that reports how many operations modifying items in the list are still in progress.
++ */
++export const pendingActions = (state: RootState) => state.elements.pendingActions;
++
++const staleRetryQueryParameters = (state: RootState) => state.elements.staleRetryQueryParameters;
++
+ const currentPage = (_: RootState, { page }: { page: number }) => page;
+ const currentSearch = (_: RootState, { search }: { search: SearchParameters }) => search;
+ const currentParams = (_: RootState, { params }: { params: ElementsStateParams }) => params;
+@@ -111,8 +118,17 @@ export const shouldResetCache = createSelector(
+ );
+ 
+ export const shouldSendRequest = createSelector(
+-    [shouldResetCache, pendingRequest, retry, needsMoreElements, invalidated, pageCached],
+-    (shouldResetCache, pendingRequest, retry, needsMoreElements, invalidated, pageCached) => {
++    [shouldResetCache, pendingRequest, retry, needsMoreElements, invalidated, pageCached, staleRetryQueryParameters, pendingActions],
++    (shouldResetCache, pendingRequest, retry, needsMoreElements, invalidated, pageCached, staleRetryQueryParameters, pendingActions) => {
++        // If there are pending backend actions, hold back the request
++        if (pendingActions > 0) {
++            return false;
++        }
++        // If there is a stale retry pending, we should not send a new request
++        // The stale retry will trigger its own request after the delay
++        if (staleRetryQueryParameters) {
++            return false;
++        }
+         return (
+             shouldResetCache ||
+             (!pendingRequest &&
+@@ -182,8 +198,9 @@ export const placeholderCount = createSelector(
+ );
+ 
+ export const loading = createSelector(
+-    [beforeFirstLoad, pendingRequest, invalidated],
+-    (beforeFirstLoad, pendingRequest, invalidated) => (beforeFirstLoad || pendingRequest) && !invalidated
++    [beforeFirstLoad, pendingRequest, invalidated, staleRetryQueryParameters],
++    (beforeFirstLoad, pendingRequest, invalidated, staleRetryQueryParameters) =>
++        (beforeFirstLoad || pendingRequest || staleRetryQueryParameters) && !invalidated
+ );
+ 
+ export const totalReturned = createSelector([dynamicTotal, total], (dynamicTotal, total) => dynamicTotal || total);
+diff --git a/applications/mail/src/app/logic/elements/elementsSlice.ts b/applications/mail/src/app/logic/elements/elementsSlice.ts
+index 49e1a7fd3..15c148fda 100644
+--- a/applications/mail/src/app/logic/elements/elementsSlice.ts
++++ b/applications/mail/src/app/logic/elements/elementsSlice.ts
+@@ -1,5 +1,5 @@
+ import { MAILBOX_LABEL_IDS } from '@proton/shared/lib/constants';
+-import { createSlice } from '@reduxjs/toolkit';
++import { createSlice, createAsyncThunk, unwrapResult } from '@reduxjs/toolkit';
+ import { ElementsState, ElementsStateParams, NewStateParams } from './elementsTypes';
+ import {
+     reset,
+@@ -17,6 +17,9 @@ import {
+     optimisticEmptyLabel,
+     optimisticRestoreEmptyLabel,
+     optimisticMarkAs,
++    retryStale,
++    backendActionStarted,
++    backendActionFinished,
+ } from './elementsActions';
+ import {
+     globalReset as globalResetReducer,
+@@ -34,8 +37,12 @@ import {
+     optimisticUpdates,
+     optimisticDelete as optimisticDeleteReducer,
+     optimisticEmptyLabel as optimisticEmptyLabelReducer,
++    retryStale as retryStaleReducer,
++    backendActionStarted as backendActionStartedReducer,
++    backendActionFinished as backendActionFinishedReducer,
+ } from './elementsReducers';
+ import { globalReset } from '../actions';
++import { RootState } from '../store';
+ 
+ export const newState = ({
+     page = 0,
+@@ -62,6 +69,9 @@ export const newState = ({
+         pages: [],
+         bypassFilter: [],
+         retry,
++        pendingActions: 0,
++        staleRetryQueryParameters: null,
++        staleRetryTimer: null,
+     };
+ };
+ 
+@@ -91,6 +101,10 @@ const elementsSlice = createSlice({
+         builder.addCase(optimisticEmptyLabel, optimisticEmptyLabelReducer);
+         builder.addCase(optimisticRestoreEmptyLabel, optimisticUpdates);
+         builder.addCase(optimisticMarkAs, optimisticUpdates);
++
++        builder.addCase(retryStale, retryStaleReducer);
++        builder.addCase(backendActionStarted, backendActionStartedReducer);
++        builder.addCase(backendActionFinished, backendActionFinishedReducer);
+     },
+ });
+ 
+diff --git a/applications/mail/src/app/logic/elements/elementsTypes.ts b/applications/mail/src/app/logic/elements/elementsTypes.ts
+index 413454df3..aaecfddc0 100644
+--- a/applications/mail/src/app/logic/elements/elementsTypes.ts
++++ b/applications/mail/src/app/logic/elements/elementsTypes.ts
+@@ -73,6 +73,22 @@ export interface ElementsState {
+      * Keeps track of the last request to count the number of attemps
+      */
+     retry: RetryData;
++
++    /**
++     * Number of operations modifying items in the list that are in progress
++     */
++    pendingActions: number;
++
++    /**
++     * Query parameters for a stale retry that is scheduled but not yet issued
++     * When present, the list should show placeholders until the retry completes
++     */
++    staleRetryQueryParameters: any | null;
++
++    /**
++     * Timer ID for the stale retry delay
++     */
++    staleRetryTimer: ReturnType<typeof setTimeout> | null;
+ }
+ 
+ export interface QueryParams {
+@@ -87,6 +103,11 @@ export interface QueryResults {
+     abortController: AbortController;
+     Total: number;
+     Elements: Element[];
++    /**
++     * Stale flag from the server response.
++     * Stale === 1 means the response data is stale and should not be committed.
++     */
++    Stale?: number;
+ }
+ 
+ export interface NewStateParams {
+diff --git a/applications/mail/src/app/logic/elements/helpers/elementQuery.ts b/applications/mail/src/app/logic/elements/helpers/elementQuery.ts
+index 475332f96..357d67f5d 100644
+--- a/applications/mail/src/app/logic/elements/helpers/elementQuery.ts
++++ b/applications/mail/src/app/logic/elements/helpers/elementQuery.ts
+@@ -4,7 +4,13 @@ import isDeepEqual from '@proton/shared/lib/helpers/isDeepEqual';
+ import { Api } from '@proton/shared/lib/interfaces';
+ import { ELEMENTS_CACHE_REQUEST_SIZE, PAGE_SIZE } from '../../../constants';
+ import { Element } from '../../../models/element';
+-import { QueryParams, QueryResults, RetryData } from '../elementsTypes';
++import { QueryParams, RetryData } from '../elementsTypes';
++import type { QueryResults as BaseQueryResults } from '../elementsTypes';
++
++// Extended QueryResults with Stale support
++export interface QueryResults extends BaseQueryResults {
++    Stale?: number;
++}
+ 
+ export const getQueryElementsParameters = ({ page, params: { labelID, sort, search, filter } }: QueryParams): any => ({
+     Page: page,
+@@ -44,6 +50,7 @@ export const queryElements = async (
+         abortController: newAbortController,
+         Total: result.Total,
+         Elements: conversationMode ? result.Conversations : result.Messages,
++        Stale: result.Stale,
+     };
+ };
+ 
+diff --git a/applications/mail/src/app/logic/store.ts b/applications/mail/src/app/logic/store.ts
+index 95d5c8b14..5e4d45c14 100644
+--- a/applications/mail/src/app/logic/store.ts
++++ b/applications/mail/src/app/logic/store.ts
+@@ -4,6 +4,7 @@ import attachments from './attachments/attachmentsSlice';
+ import conversations from './conversations/conversationsSlice';
+ import messages from './messages/messagesSlice';
+ import contacts from './contacts/contactsSlice';
++import elementsMiddleware from './elements/elementsMiddleware';
+ 
+ export const store = configureStore({
+     reducer: {
+@@ -39,7 +40,7 @@ export const store = configureStore({
+ 
+                 warnAfter: 100,
+             },
+-        }),
++        }).concat(elementsMiddleware),
+ });
+ 
+ // Infer the `RootState` and `AppDispatch` types from the store itself

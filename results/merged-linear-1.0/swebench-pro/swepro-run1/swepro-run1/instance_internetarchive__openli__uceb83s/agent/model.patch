@@ -1,0 +1,2103 @@
+diff --git a/openlibrary/catalog/marc/parse.py b/openlibrary/catalog/marc/parse.py
+index 76a554da2..1549ca826 100644
+--- a/openlibrary/catalog/marc/parse.py
++++ b/openlibrary/catalog/marc/parse.py
+@@ -12,7 +12,7 @@ from openlibrary.catalog.utils import (
+ 
+ DNB_AGENCY_CODE = 'DE-101'
+ max_number_of_pages = 50000  # no monograph should be longer than 50,000 pages
+-re_bad_char = re.compile('\ufffd')
++re_bad_char = re.compile(r'\ufffd')
+ re_question = re.compile(r'^\?+$')
+ re_lccn = re.compile(r'([ \dA-Za-z\-]{3}[\d/-]+).*')
+ re_oclc = re.compile(r'^\(OCoLC\).*?0*(\d+)')
+@@ -72,6 +72,7 @@ FIELDS_WANTED = (
+         '740',  # other titles
+         '852',  # location
+         '856',  # electronic location / URL
++        '880',  # alternate script
+     ]
+ )
+ 
+@@ -379,13 +380,22 @@ def read_publisher(rec):
+     return edition
+ 
+ 
+-def read_author_person(f):
+-    f.remove_brackets()
++def read_author_person(field, tag: str = '100', rec: Optional[object] = None):
++    """
++    Parse a MARC field containing personal name information.
++    
++    :param field: MARC field object (e.g., from fields 100, 700, or 720)
++    :param tag: The MARC tag of the original field (used for resolving 880 linkages)
++    :param rec: The MARC record object (needed to access 880 fields for linkage resolution)
++    :rtype: dict
++    :return: Author data dictionary
++    """
++    field.remove_brackets()
+     author = {}
+-    contents = f.get_contents(['a', 'b', 'c', 'd', 'e'])
++    contents = field.get_contents(['a', 'b', 'c', 'd', 'e'])
+     if 'a' not in contents and 'c' not in contents:
+         return  # should at least be a name or title
+-    name = [v.strip(' /,;:') for v in f.get_subfield_values(['a', 'b', 'c'])]
++    name = [v.strip(' /,;:') for v in field.get_subfield_values(['a', 'b', 'c'])]
+     if 'd' in contents:
+         author = pick_first_date(strip_foc(d).strip(',') for d in contents['d'])
+         if 'death_date' in author and author['death_date']:
+@@ -407,12 +417,130 @@ def read_author_person(f):
+             )
+     if 'q' in contents:
+         author['fuller_name'] = ' '.join(contents['q'])
+-    for f in 'name', 'personal_name':
+-        if f in author:
+-            author[f] = remove_trailing_dot(strip_foc(author[f]))
++    for name_field in ('name', 'personal_name'):
++        if name_field in author:
++            author[name_field] = remove_trailing_dot(strip_foc(author[name_field]))
++    
++    # Handle alternate-script names via subfield 6 linkage to 880 fields
++    author['alternate_names'] = _get_alternate_names_from_880(field, tag, rec)
++    
+     return author
+ 
+ 
++def _get_alternate_names_from_880(field, tag: str, rec: Optional[object]) -> list:
++    """
++    Extract alternate-script names from linked 880 fields.
++    
++    When a field has a subfield 6 linking to an 880 field, this function
++    resolves the linkage and extracts alternate name(s) from the 880 field.
++    
++    :param field: The original MARC field (e.g., 100, 700, or 720)
++    :param tag: The MARC tag of the original field
++    :param rec: The MARC record object (needed to access 880 fields)
++    :rtype: list
++    :return: List of alternate name strings (may be empty)
++    """
++    if rec is None:
++        return []
++    
++    # Get all subfields from the field
++    all_subfields = list(field.get_all_subfields())
++    
++    # Find the '6' subfield which contains the linkage
++    linkage_value = None
++    for code, value in all_subfields:
++        if code == '6':
++            linkage_value = value
++            break
++    
++    if not linkage_value:
++        return []
++    
++    # Parse the linkage value to extract the target tag and sequence number
++    # Format is typically "{tag}-{seq}" or "{tag}-{seq}/..."
++    # e.g., "880-05" or "880-05/(3/r"
++    linkage_parts = linkage_value.split('-')
++    if len(linkage_parts) < 2:
++        return []
++    
++    target_tag = linkage_parts[0]
++    seq_part = linkage_parts[1]
++    
++    # Only proceed if this is an 880 field
++    if target_tag != '880':
++        return []
++    
++    # Extract the sequence number (may be followed by additional info after '/')
++    seq_number = seq_part.split('/')[0] if '/' in seq_part else seq_part
++    
++    try:
++        target_sequence = int(seq_number)
++    except (ValueError, IndexError):
++        return []
++    
++    # Get the 880 fields from the record
++    eight_eight_zero_fields = rec.get_fields('880')
++    
++    # Find the specific 880 field by matching the sequence number
++    for eight_eight_zero_field in eight_eight_zero_fields:
++        eight_eight_zero_field.remove_brackets()
++        
++        # Get the linkage from this 880 field
++        eight_eight_zero_subfields = list(eight_eight_zero_field.get_all_subfields())
++        for code, value in eight_eight_zero_subfields:
++            if code == '6':
++                # Parse the linkage value from the 880 field
++                # Format is like "700-04/$1"
++                value_parts = value.split('-')
++                if len(value_parts) >= 2:
++                    value_tag = value_parts[0]
++                    value_seq = value_parts[1].split('/')[0] if '/' in value_parts[1] else value_parts[1]
++                    
++                    # Check if the tag matches and the sequence number matches
++                    if value_tag == tag and value_seq == seq_number:
++                        # Extract the alternate name from subfield 'a'
++                        alternate_name = eight_eight_zero_field.get_subfield_values(['a'])
++                        if alternate_name:
++                            # Normalize the alternate name
++                            normalized = name_from_list(alternate_name)
++                            return [normalized]
++    
++    return []
++
++
++def name_from_list(name_parts: list[str]) -> str:
++    """
++    Builds a normalized name string from a list of name parts.
++    
++    Trims each part, removes separator characters (/,, ;,:, [,]), 
++    and applies trailing-period normalization: a trailing period is 
++    removed only when it does not immediately follow a single character.
++    
++    :param name_parts: List of name component strings
++    :rtype: str
++    :return: Normalized name string
++    """
++    if not name_parts:
++        return ''
++    
++    STRIP_CHARS = r' /,;:[\]'
++    
++    # Strip separator characters and whitespace from each part, filter out empty strings
++    stripped_parts = [part.strip(STRIP_CHARS) for part in name_parts]
++    stripped_parts = [part for part in stripped_parts if part]
++    
++    if not stripped_parts:
++        return ''
++    
++    # Join the parts with a space
++    result = ' '.join(stripped_parts)
++    
++    # Apply trailing-period normalization
++    result = remove_trailing_dot(result)
++    
++    return result
++
++
+ # 1. if authors in 100, 110, 111 use them
+ # 2. if first contrib is 700, 710, or 711 use it
+ def person_last_name(f):
+@@ -443,7 +571,7 @@ def read_authors(rec):
+     # 100 1  $aDowling, James Walter Frederick.
+     # 111 2  $aConference on Civil Engineering Problems Overseas.
+ 
+-    found = [f for f in (read_author_person(f) for f in fields_100) if f]
++    found = [f for f in (read_author_person(f, tag='100', rec=rec) for f in fields_100) if f]
+     for f in fields_110:
+         f.remove_brackets()
+         name = [v.strip(' /,;:') for v in f.get_subfield_values(['a', 'b'])]
+@@ -595,7 +723,7 @@ def read_contributions(rec):
+             f = rec.decode_field(f)
+             if tag in ('700', '720'):
+                 if 'authors' not in ret or last_name_in_245c(rec, f):
+-                    ret.setdefault('authors', []).append(read_author_person(f))
++                    ret.setdefault('authors', []).append(read_author_person(f, tag=tag, rec=rec))
+                     skip_authors.add(tuple(f.get_subfields(want[tag])))
+                 continue
+             elif 'authors' in ret:
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/13dipolarcycload00burk_meta.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/13dipolarcycload00burk_meta.json
+index 439d06a3b..8396a43db 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/13dipolarcycload00burk_meta.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/13dipolarcycload00burk_meta.json
+@@ -16,9 +16,10 @@
+   "authors": [
+     {
+       "birth_date": "1954",
+-      "personal_name": "Burkholder, Conrad",
+       "name": "Burkholder, Conrad",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Burkholder, Conrad",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "by Conrad Burkholder",
+@@ -28,4 +29,4 @@
+   "location": [
+     "FU"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/880_Nihon_no_chasho.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/880_Nihon_no_chasho.json
+index 3556fb00a..23ea14bc5 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/880_Nihon_no_chasho.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/880_Nihon_no_chasho.json
+@@ -19,19 +19,28 @@
+       "death_date": "1998",
+       "name": "Hayashiya, Tatsusaburō",
+       "entity_type": "person",
+-      "personal_name": "Hayashiya, Tatsusaburō"
++      "personal_name": "Hayashiya, Tatsusaburō",
++      "alternate_names": [
++        "林屋 辰三郎"
++      ]
+     },
+     {
+       "name": "Yokoi, Kiyoshi",
+       "entity_type": "person",
+-      "personal_name": "Yokoi, Kiyoshi"
++      "personal_name": "Yokoi, Kiyoshi",
++      "alternate_names": [
++        "横井 清."
++      ]
+     },
+     {
+       "birth_date": "1940",
+       "death_date": "1960",
+       "name": "Narabayashi, Tadao",
+       "entity_type": "person",
+-      "personal_name": "Narabayashi, Tadao"
++      "personal_name": "Narabayashi, Tadao",
++      "alternate_names": [
++        "楢林 忠男"
++      ]
+     }
+   ],
+   "subjects": [
+@@ -50,4 +59,4 @@
+     "Tōkyō"
+   ],
+   "pagination": "2 volumes"
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/880_alternate_script.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/880_alternate_script.json
+index 285ee9211..929f3fed2 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/880_alternate_script.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/880_alternate_script.json
+@@ -9,7 +9,8 @@
+       "birth_date": "1960",
+       "name": "Lyons, Daniel",
+       "entity_type": "person",
+-      "personal_name": "Lyons, Daniel"
++      "personal_name": "Lyons, Daniel",
++      "alternate_names": []
+     }
+   ],
+   "oclc_numbers": [
+@@ -37,7 +38,9 @@
+     "Steve Jobs (1955-2011)"
+   ],
+   "title": "乔布斯的秘密日记",
+-  "other_titles": ["Qiaobusi de mi mi ri ji"],
++  "other_titles": [
++    "Qiaobusi de mi mi ri ji"
++  ],
+   "by_statement": "Danni'er Lai'angsi zhu ; Liu Ning yi",
+   "publishers": [
+     "Zhong xin chu ban she"
+@@ -53,4 +56,4 @@
+   ],
+   "pagination": "xi, 274 p.",
+   "number_of_pages": 274
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/880_arabic_french_many_linkages.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/880_arabic_french_many_linkages.json
+index 456895f34..e5d6babd6 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/880_arabic_french_many_linkages.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/880_arabic_french_many_linkages.json
+@@ -21,7 +21,10 @@
+     {
+       "name": "El Moudden, Abderrahmane",
+       "entity_type": "person",
+-      "personal_name": "El Moudden, Abderrahmane"
++      "personal_name": "El Moudden, Abderrahmane",
++      "alternate_names": [
++        "مودن، عبد الرحيم"
++      ]
+     }
+   ],
+   "contributions": [
+@@ -66,4 +69,4 @@
+   ],
+   "pagination": "247, 16 pages",
+   "number_of_pages": 247
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/880_publisher_unlinked.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/880_publisher_unlinked.json
+index fee0637f8..363ed3714 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/880_publisher_unlinked.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/880_publisher_unlinked.json
+@@ -14,7 +14,8 @@
+     {
+       "name": "Hailman, Ben",
+       "entity_type": "person",
+-      "personal_name": "Hailman, Ben"
++      "personal_name": "Hailman, Ben",
++      "alternate_names": []
+     }
+   ],
+   "oclc_numbers": [
+@@ -40,4 +41,4 @@
+   ],
+   "pagination": "47 p.",
+   "number_of_pages": 47
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/880_table_of_contents.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/880_table_of_contents.json
+index ed366dada..702caee32 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/880_table_of_contents.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/880_table_of_contents.json
+@@ -8,7 +8,8 @@
+     {
+       "name": "Petrushevskai︠a︡, Li︠u︡dmila",
+       "entity_type": "person",
+-      "personal_name": "Petrushevskai︠a︡, Li︠u︡dmila"
++      "personal_name": "Petrushevskai︠a︡, Li︠u︡dmila",
++      "alternate_names": []
+     }
+   ],
+   "other_titles": [
+@@ -42,4 +43,4 @@
+   ],
+   "pagination": "396 p.",
+   "number_of_pages": 396
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/bijouorannualofl1828cole_meta.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/bijouorannualofl1828cole_meta.json
+index 7afb9a238..f719177f7 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/bijouorannualofl1828cole_meta.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/bijouorannualofl1828cole_meta.json
+@@ -20,10 +20,11 @@
+   "authors": [
+     {
+       "birth_date": "1772",
+-      "personal_name": "Coleridge, Samuel Taylor",
+       "death_date": "1834",
+       "name": "Coleridge, Samuel Taylor",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Coleridge, Samuel Taylor",
++      "alternate_names": []
+     }
+   ],
+   "publish_places": [
+@@ -32,4 +33,4 @@
+   "contributions": [
+     "Lamb, Charles, 1775-1834"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/bpl_0486266893.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/bpl_0486266893.json
+index 516753f30..50e6444ab 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/bpl_0486266893.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/bpl_0486266893.json
+@@ -14,7 +14,9 @@
+   "work_titles": [
+     "Candide"
+   ],
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "dewey_decimal_class": [
+     "843/.5"
+   ],
+@@ -29,10 +31,11 @@
+   "authors": [
+     {
+       "birth_date": "1694",
+-      "personal_name": "Voltaire",
+       "death_date": "1778",
+       "name": "Voltaire",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Voltaire",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "Voltaire",
+@@ -42,5 +45,7 @@
+   "isbn_10": [
+     "0486266893"
+   ],
+-  "translated_from": ["fre"]
+-}
++  "translated_from": [
++    "fre"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/collingswood_520aa.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/collingswood_520aa.json
+index 682bcb265..4ca2a849d 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/collingswood_520aa.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/collingswood_520aa.json
+@@ -15,14 +15,22 @@
+   "publish_country": "ctu",
+   "authors": [
+     {
+-      "personal_name": "Philbrick, W. R.",
+       "name": "Philbrick, W. R.",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Philbrick, W. R.",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "Rodman Philbrick. e.",
+   "publish_places": [
+     "Greenwitch, CT"
+   ],
+-  "subjects": ["Learning disabilities", "People with disabilities", "Talking books", "Juvenile literature", "Juvenile fiction", "Friendship"]
+-}
++  "subjects": [
++    "Learning disabilities",
++    "People with disabilities",
++    "Talking books",
++    "Juvenile literature",
++    "Juvenile fiction",
++    "Friendship"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/collingswood_bad_008.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/collingswood_bad_008.json
+index 7cf37b19b..d8a8bd411 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/collingswood_bad_008.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/collingswood_bad_008.json
+@@ -10,7 +10,9 @@
+     "Dutton"
+   ],
+   "number_of_pages": 128,
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "isbn_10": [
+     "0525230106"
+   ],
+@@ -18,14 +20,18 @@
+   "publish_country": "nyu",
+   "authors": [
+     {
+-      "personal_name": "Young, Peter",
+       "name": "Young, Peter",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Young, Peter",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "General editor: Peter Young. Pref. by Aram Bakshian, Jr. War games photographed by Philip O. Stearns",
+   "publish_places": [
+     "New York"
+   ],
+-  "subjects": ["War games", "Battles"]
+-}
++  "subjects": [
++    "War games",
++    "Battles"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/cu31924091184469_meta.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/cu31924091184469_meta.json
+index 30c18f644..e5584c848 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/cu31924091184469_meta.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/cu31924091184469_meta.json
+@@ -12,7 +12,9 @@
+   ],
+   "notes": "Includes bibliographical references.",
+   "number_of_pages": 466,
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "lc_classifications": [
+     "PA4025.A2 B83 1896"
+   ],
+@@ -20,9 +22,10 @@
+   "publish_country": "nyu",
+   "authors": [
+     {
+-      "personal_name": "Homer",
+       "name": "Homer",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Homer",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "literally translated, with explanatory notes, by Theodore Alois Buckley",
+@@ -35,4 +38,4 @@
+   "publish_places": [
+     "New York"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/diebrokeradical400poll_meta.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/diebrokeradical400poll_meta.json
+index c8744ee97..93cbb2a6d 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/diebrokeradical400poll_meta.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/diebrokeradical400poll_meta.json
+@@ -8,7 +8,9 @@
+   ],
+   "notes": "Includes index.",
+   "number_of_pages": 304,
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "dewey_decimal_class": [
+     "332.024"
+   ],
+@@ -22,9 +24,10 @@
+   "publish_country": "nyu",
+   "authors": [
+     {
+-      "personal_name": "Pollan, Stephen M.",
+       "name": "Pollan, Stephen M.",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Pollan, Stephen M.",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "Stephen M. Pollan and Mark Levine",
+@@ -37,5 +40,7 @@
+   "isbn_10": [
+     "0887308678"
+   ],
+-  "subjects": ["Personal Finance"]
+-}
++  "subjects": [
++    "Personal Finance"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/engineercorpsofh00sher_meta.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/engineercorpsofh00sher_meta.json
+index d76a1a3a0..f7e2bd3d0 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/engineercorpsofh00sher_meta.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/engineercorpsofh00sher_meta.json
+@@ -7,16 +7,19 @@
+   "title": "The Engineer Corps of Hell; or, Rome's sappers and miners",
+   "notes": "\"Sold by private subscription only, and under stipulated conditions.\"\n\nIncludes the Papal syllabus of errors by Pope Pius IX.",
+   "number_of_pages": 320,
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "publish_date": "1883",
+   "publish_country": "cau",
+   "authors": [
+     {
+       "birth_date": "1829",
+-      "personal_name": "Sherman, Edwin Allen",
+       "death_date": "1914",
+       "name": "Sherman, Edwin Allen",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Sherman, Edwin Allen",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "Compiled and translated by Edwin A. Sherman",
+@@ -29,5 +32,8 @@
+   "publish_places": [
+     "San Francisco?"
+   ],
+-  "subjects": ["Controversial literature", "Jesuits"]
+-}
++  "subjects": [
++    "Controversial literature",
++    "Jesuits"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/equalsign_title.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/equalsign_title.json
+index 06eeb8c52..b42415fdf 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/equalsign_title.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/equalsign_title.json
+@@ -15,11 +15,11 @@
+   "publish_country": "wlk",
+   "authors": [
+     {
+-      "name": "Gwynedd (Wales). Education Department",
+-      "entity_type": "org"
++      "entity_type": "org",
++      "name": "Gwynedd (Wales). Education Department"
+     }
+   ],
+   "publish_places": [
+     "Caernarfon"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/flatlandromanceo00abbouoft_meta.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/flatlandromanceo00abbouoft_meta.json
+index 2f4ce27c4..8b2710f17 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/flatlandromanceo00abbouoft_meta.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/flatlandromanceo00abbouoft_meta.json
+@@ -5,7 +5,9 @@
+   "pagination": "viii p., 1 l.",
+   "subtitle": "a romance of many dimensions",
+   "title": "Flatland",
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "lc_classifications": [
+     "QA699 .A12"
+   ],
+@@ -14,14 +16,15 @@
+   "authors": [
+     {
+       "birth_date": "1838",
+-      "personal_name": "Abbott, Edwin Abbott",
+       "death_date": "1926",
+       "name": "Abbott, Edwin Abbott",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Abbott, Edwin Abbott",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "by A. Square ; with illustrations by the author",
+   "publish_places": [
+     "London"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/henrywardbeecher00robauoft_meta.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/henrywardbeecher00robauoft_meta.json
+index 200a2d19b..905e6dabc 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/henrywardbeecher00robauoft_meta.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/henrywardbeecher00robauoft_meta.json
+@@ -1,5 +1,7 @@
+ {
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "publishers": [
+     "W. Scott"
+   ],
+@@ -7,10 +9,11 @@
+   "publish_country": "enk",
+   "authors": [
+     {
+-      "title": "1",
+       "name": "ROBA 1",
++      "entity_type": "person",
+       "numeration": "ROBA",
+-      "entity_type": "person"
++      "title": "1",
++      "alternate_names": []
+     }
+   ],
+   "subtitle": "his life and work",
+@@ -18,4 +21,4 @@
+     "London"
+   ],
+   "title": "Henry Ward Beecher"
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/histoirereligieu05cr_meta.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/histoirereligieu05cr_meta.json
+index 4dfa217af..a4310a0be 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/histoirereligieu05cr_meta.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/histoirereligieu05cr_meta.json
+@@ -1,11 +1,13 @@
+ {
+-  "edition_name": "Deuxi\u00e8me ed.",
++  "edition_name": "Deuxième ed.",
+   "pagination": "6 v.",
+-  "subtitle": "compos\u00e9e sur les documents in\u00e9didts et authentiques",
+-  "title": "Histoire religieuse, politique et litt\u00e9raire de la Compagnie de J\u00e9sus",
+-  "languages": ["fre"],
++  "subtitle": "composée sur les documents inédidts et authentiques",
++  "title": "Histoire religieuse, politique et littéraire de la Compagnie de Jésus",
++  "languages": [
++    "fre"
++  ],
+   "publishers": [
+-    "Librarie Religieuse Mellier Fr\u00e8res",
++    "Librarie Religieuse Mellier Frères",
+     "Guyot"
+   ],
+   "publish_date": "1846",
+@@ -13,13 +15,14 @@
+   "authors": [
+     {
+       "birth_date": "1803",
+-      "personal_name": "Cr\u00e9tineau-Joly, J.",
+       "death_date": "1875",
+-      "name": "Cr\u00e9tineau-Joly, J.",
+-      "entity_type": "person"
++      "name": "Crétineau-Joly, J.",
++      "entity_type": "person",
++      "personal_name": "Crétineau-Joly, J.",
++      "alternate_names": []
+     }
+   ],
+-  "by_statement": "par J. Cr\u00e9tineau-Joly",
++  "by_statement": "par J. Crétineau-Joly",
+   "oclc_numbers": [
+     "10603157"
+   ],
+@@ -27,5 +30,9 @@
+     "Paris",
+     "Lyon"
+   ],
+-  "subjects": ["Jesuits", "Influence", "History"]
+-}
++  "subjects": [
++    "Jesuits",
++    "Influence",
++    "History"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/ithaca_college_75002321.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/ithaca_college_75002321.json
+index d29b819e3..d49a511f3 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/ithaca_college_75002321.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/ithaca_college_75002321.json
+@@ -13,7 +13,9 @@
+   ],
+   "notes": "Papers and comments presented at the conference at Brookings Institution, Apr. 29-30, 1974, sponsored by the Brookings Panel on Social Experimentation.\n\nIncludes bibliographical references and index.",
+   "number_of_pages": 232,
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "dewey_decimal_class": [
+     "361.6/2/09749"
+   ],
+@@ -25,15 +27,17 @@
+   "authors": [
+     {
+       "birth_date": "1918",
+-      "personal_name": "Pechman, Joseph A.",
+       "name": "Pechman, Joseph A.",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Pechman, Joseph A.",
++      "alternate_names": []
+     },
+     {
+       "birth_date": "1934",
+-      "personal_name": "Timpane, P. Michael",
+       "name": "Timpane, P. Michael",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Timpane, P. Michael",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "editors, Joseph A. Pechman, P. Michael Timpane",
+@@ -47,6 +51,13 @@
+     "0815769768",
+     "081576975X"
+   ],
+-  "subjects": ["Congresses", "Negative income tax", "Guaranteed annual income", "Labor supply"],
+-  "subject_places": ["New Jersey"]
+-}
++  "subjects": [
++    "Congresses",
++    "Negative income tax",
++    "Guaranteed annual income",
++    "Labor supply"
++  ],
++  "subject_places": [
++    "New Jersey"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/ithaca_two_856u.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/ithaca_two_856u.json
+index 55280d9ea..42d8794ba 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/ithaca_two_856u.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/ithaca_two_856u.json
+@@ -18,7 +18,9 @@
+     "72626487"
+   ],
+   "notes": "Subtitle varies: \"An official handbook,\" 1949-50-1998; \"the official yearbook of the United Kingdom,\" 1999-2001.\n\nPublished: H.M.S.O., <1955>-1996; The Stationery Office, 1997-2001.\n\nSome issues also available online via the World Wide Web.\n\nPrepared by: the Office for National Statistics, 1998-2001.",
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "work_titles": [
+     "Britain (London, England)"
+   ],
+@@ -29,8 +31,8 @@
+   "publish_country": "enk",
+   "authors": [
+     {
+-      "name": "Great Britain. Central Office of Information",
+-      "entity_type": "org"
++      "entity_type": "org",
++      "name": "Great Britain. Central Office of Information"
+     }
+   ],
+   "by_statement": "issued by the Central Office of Information",
+@@ -40,7 +42,16 @@
+   "contributions": [
+     "Great Britain. Office for National Statistics"
+   ],
+-  "subjects": ["Statistics", "Periodicals"],
+-  "subject_places": ["Great Britain"],
+-  "identifiers": {"issn": ["0068-1075"]}
+-}
++  "subjects": [
++    "Statistics",
++    "Periodicals"
++  ],
++  "subject_places": [
++    "Great Britain"
++  ],
++  "identifiers": {
++    "issn": [
++      "0068-1075"
++    ]
++  }
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/lc_0444897283.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/lc_0444897283.json
+index 177e6c694..d276d0b95 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/lc_0444897283.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/lc_0444897283.json
+@@ -13,7 +13,9 @@
+   ],
+   "notes": "Includes bibliographical references.",
+   "number_of_pages": 376,
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "dewey_decimal_class": [
+     "623.8/1/0285"
+   ],
+@@ -24,22 +26,29 @@
+   "publish_country": "ne",
+   "authors": [
+     {
+-      "name": "IFIP TC5/WG 5.6 International Conference on Computer Applications in the Automation of Shipyard Operation and Ship Design (7th 1991 Rio de Janeiro, Brazil)",
+-      "entity_type": "event"
++      "entity_type": "event",
++      "name": "IFIP TC5/WG 5.6 International Conference on Computer Applications in the Automation of Shipyard Operation and Ship Design (7th 1991 Rio de Janeiro, Brazil)"
+     }
+   ],
+-  "by_statement": "edited by Claudio Bara\u00fana Vieira, Prot\u00e1sio Martins, Chengi Kuo",
++  "by_statement": "edited by Claudio Baraúna Vieira, Protásio Martins, Chengi Kuo",
+   "publish_places": [
+     "Amsterdam",
+     "New York"
+   ],
+   "contributions": [
+-    "Vieira, Claudio Bara\u00fana, 1944-",
+-    "Martins, Prot\u00e1sio, 1950-",
++    "Vieira, Claudio Baraúna, 1944-",
++    "Martins, Protásio, 1950-",
+     "Kuo, Chengi"
+   ],
+   "isbn_10": [
+     "0444897283"
+   ],
+-  "subjects": ["Shipyards", "Shipbuilding", "Data processing", "Congresses", "Naval architecture", "Automation"]
+-}
++  "subjects": [
++    "Shipyards",
++    "Shipbuilding",
++    "Data processing",
++    "Congresses",
++    "Naval architecture",
++    "Automation"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/lc_1416500308.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/lc_1416500308.json
+index c6ac0b834..09bb8cedd 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/lc_1416500308.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/lc_1416500308.json
+@@ -12,7 +12,9 @@
+     "Enriched classics series"
+   ],
+   "number_of_pages": 178,
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "work_titles": [
+     "Candide"
+   ],
+@@ -24,10 +26,11 @@
+   "authors": [
+     {
+       "birth_date": "1694",
+-      "personal_name": "Voltaire",
+       "death_date": "1778",
+       "name": "Voltaire",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Voltaire",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "Voltaire ; supplementary material written by Alyssa Harad",
+@@ -37,5 +40,7 @@
+   "isbn_10": [
+     "1416500308"
+   ],
+-  "translated_from": ["fre"]
+-}
++  "translated_from": [
++    "fre"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/memoirsofjosephf00fouc_meta.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/memoirsofjosephf00fouc_meta.json
+index 5dc298e32..37de96607 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/memoirsofjosephf00fouc_meta.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/memoirsofjosephf00fouc_meta.json
+@@ -9,7 +9,7 @@
+   "lccn": [
+     "16010652"
+   ],
+-  "notes": "\"When first published [1824] the Memoirs were accepted as Fouch\u00e9's own work, but owing to a suit instituted by his family they were later admitted to be that of Alphonse de Beauchamp ... But ... the work is undoubtedly based on Fouché's own notes and papers.\" -- Introduction to Memoirs relating to Fouché' ... Tr. from the French by E. Jules Méras. New York, 1912.",
++  "notes": "\"When first published [1824] the Memoirs were accepted as Fouché's own work, but owing to a suit instituted by his family they were later admitted to be that of Alphonse de Beauchamp ... But ... the work is undoubtedly based on Fouché's own notes and papers.\" -- Introduction to Memoirs relating to Fouché' ... Tr. from the French by E. Jules Méras. New York, 1912.",
+   "number_of_pages": 474,
+   "languages": [
+     "eng"
+@@ -25,12 +25,13 @@
+   "by_statement": "Tr. from the French",
+   "authors": [
+     {
++      "birth_date": "1759",
+       "death_date": "1820",
+       "name": "Fouché, Joseph duc d'Otrante",
+-      "title": "duc d'Otrante",
++      "entity_type": "person",
+       "personal_name": "Fouché, Joseph",
+-      "birth_date": "1759",
+-      "entity_type": "person"
++      "title": "duc d'Otrante",
++      "alternate_names": []
+     }
+   ],
+   "publish_places": [
+@@ -53,5 +54,7 @@
+   "subject_times": [
+     "1789-1815"
+   ],
+-  "translated_from": ["fre"]
+-}
++  "translated_from": [
++    "fre"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/merchantsfromcat00ben_meta.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/merchantsfromcat00ben_meta.json
+index 8c3550071..ceaba7e4a 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/merchantsfromcat00ben_meta.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/merchantsfromcat00ben_meta.json
+@@ -19,14 +19,15 @@
+   "authors": [
+     {
+       "birth_date": "1886",
+-      "personal_name": "Benét, William Rose",
+       "death_date": "1950",
+       "name": "Benét, William Rose",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Benét, William Rose",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "by William Rose Benét",
+   "publish_places": [
+     "New York"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/ocm00400866.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/ocm00400866.json
+index 354afd325..549489209 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/ocm00400866.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/ocm00400866.json
+@@ -1433,20 +1433,26 @@
+   ],
+   "notes": "For mixed voices 1-4 parts with piano accompaniments",
+   "number_of_pages": 572,
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "publishers": [
+     "C. C. Birchard"
+   ],
+   "publish_date": "1926",
+   "authors": [
+     {
+-      "personal_name": "Armitage, M. Teresa",
+       "name": "Armitage, M. Teresa",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Armitage, M. Teresa",
++      "alternate_names": []
+     }
+   ],
+   "publish_places": [
+     "Boston"
+   ],
+-  "subjects": ["School songbooks", "Choruses (Mixed voices) with piano"]
+-}
++  "subjects": [
++    "School songbooks",
++    "Choruses (Mixed voices) with piano"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/onquietcomedyint00brid_meta.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/onquietcomedyint00brid_meta.json
+index bc8ed71cc..cba849da3 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/onquietcomedyint00brid_meta.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/onquietcomedyint00brid_meta.json
+@@ -19,12 +19,13 @@
+   "publish_country": "mau",
+   "authors": [
+     {
+-      "personal_name": "Bridgham, Gladys Ruth",
+       "name": "Bridgham, Gladys Ruth",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Bridgham, Gladys Ruth",
++      "alternate_names": []
+     }
+   ],
+   "publish_places": [
+     "Boston"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/secretcodeofsucc00stjo_meta.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/secretcodeofsucc00stjo_meta.json
+index 452dbebf3..d4a2ffa73 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/secretcodeofsucc00stjo_meta.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/secretcodeofsucc00stjo_meta.json
+@@ -79,7 +79,9 @@
+     "9780061764547"
+   ],
+   "subtitle": "7 hidden steps to more wealth and happiness",
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "dewey_decimal_class": [
+     "650.1"
+   ],
+@@ -91,9 +93,10 @@
+   "authors": [
+     {
+       "birth_date": "1967",
+-      "personal_name": "St. John, Noah",
+       "name": "St. John, Noah",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "St. John, Noah",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "by Noah St. John ; foreword by Jack Canfield",
+@@ -107,5 +110,7 @@
+     "0061715743",
+     "006176454X"
+   ],
+-  "subjects": ["Success in business"]
+-}
++  "subjects": [
++    "Success in business"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_245p.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_245p.json
+index 9690d62a4..af15724cf 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_245p.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_245p.json
+@@ -1,5 +1,7 @@
+ {
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "publishers": [
+     "Cambridge University Press"
+   ],
+@@ -10,8 +12,8 @@
+   "publish_country": "xxk",
+   "authors": [
+     {
+-      "name": "School Mathematics Project",
+-      "entity_type": "org"
++      "entity_type": "org",
++      "name": "School Mathematics Project"
+     }
+   ],
+   "subtitle": "Pattern and design",
+@@ -19,4 +21,4 @@
+     "Cambridge (etc.)"
+   ],
+   "title": "SMP topic mathematics"
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_740.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_740.json
+index 4a47412c0..bd14574e0 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_740.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_740.json
+@@ -14,7 +14,9 @@
+   ],
+   "title": "Modern Supreme Court",
+   "number_of_pages": 390,
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "isbn_10": [
+     "0674580567"
+   ],
+@@ -22,13 +24,14 @@
+   "publish_country": "xxk",
+   "authors": [
+     {
+-      "personal_name": "McCloskey, Robert Green",
+       "name": "McCloskey, Robert Green",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "McCloskey, Robert Green",
++      "alternate_names": []
+     }
+   ],
+   "publish_places": [
+     "Cambridge,Mass",
+     "London"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_856.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_856.json
+index 6606777af..11ff32e55 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_856.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_856.json
+@@ -20,7 +20,9 @@
+   ],
+   "notes": "\"Revised and updated version of the classic guide to the Arab-Israeli Conflict\"--Back cover.\n\nIncludes bibliographical references (p. 443-444) and index.",
+   "number_of_pages": 381,
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "isbn_10": [
+     "0971294518"
+   ],
+@@ -29,9 +31,10 @@
+   "authors": [
+     {
+       "birth_date": "1959",
+-      "personal_name": "Bard, Mitchell Geoffrey",
+       "name": "Bard, Mitchell Geoffrey",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Bard, Mitchell Geoffrey",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "edited by Mitchell G. Bard ; foreword by Eli E. Hertz",
+@@ -41,6 +44,13 @@
+   "contributions": [
+     "American-Israeli Cooperative Enterprise"
+   ],
+-  "subjects": ["Politics and government", "Jewish-Arab relations", "Middle East", "Arab-Israeli conflict"],
+-  "subject_times": ["1945-"]
+-}
++  "subjects": [
++    "Politics and government",
++    "Jewish-Arab relations",
++    "Middle East",
++    "Arab-Israeli conflict"
++  ],
++  "subject_times": [
++    "1945-"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_empty_245.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_empty_245.json
+index 09b811126..b5d7f8cec 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_empty_245.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_empty_245.json
+@@ -7,17 +7,20 @@
+     "Schott's woodwind series -- Oboe and pianoforte, no.2"
+   ],
+   "notes": "Score and part.",
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "publish_date": "1950",
+   "publish_country": "xxk",
+   "authors": [
+     {
+-      "personal_name": "Cole, Hugo",
+       "name": "Cole, Hugo",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Cole, Hugo",
++      "alternate_names": []
+     }
+   ],
+   "publish_places": [
+     "London"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_multi_work_tiles.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_multi_work_tiles.json
+index e6535c34d..39f58cdca 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_multi_work_tiles.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_multi_work_tiles.json
+@@ -13,7 +13,9 @@
+     "Classics of children's literature, 1621-1932"
+   ],
+   "notes": "Facsims., originally published, London, Stockdale, 1788 and London, Johnson, 1788, respectively.",
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "isbn_10": [
+     "0824022637"
+   ],
+@@ -22,10 +24,11 @@
+   "authors": [
+     {
+       "birth_date": "1748",
+-      "personal_name": "Day, Thomas",
+       "death_date": "1789",
+       "name": "Day, Thomas",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Day, Thomas",
++      "alternate_names": []
+     }
+   ],
+   "publish_places": [
+@@ -36,4 +39,4 @@
+     "Wollstonecraft, Mary, 1759-1797",
+     "Blake, William, 1757-1827"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_no_title.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_no_title.json
+index 9326a4fef..7f431377a 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_no_title.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_no_title.json
+@@ -12,19 +12,22 @@
+   "dewey_decimal_class": [
+     "822.4"
+   ],
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "publish_date": "1895",
+   "publish_country": "xxk",
+   "authors": [
+     {
+       "birth_date": "1670",
+-      "personal_name": "Congreve, William",
+       "death_date": "1729",
+       "name": "Congreve, William",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Congreve, William",
++      "alternate_names": []
+     }
+   ],
+   "publish_places": [
+     "London"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_two_authors.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_two_authors.json
+index 8b8699779..ac3a4ba45 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_two_authors.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/talis_two_authors.json
+@@ -1,5 +1,7 @@
+ {
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "publishers": [
+     "Institution of Civil Engineers"
+   ],
+@@ -8,13 +10,14 @@
+   "publish_country": "xxk",
+   "authors": [
+     {
+-      "personal_name": "Dowling, James Walter Frederick",
+       "name": "Dowling, James Walter Frederick",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Dowling, James Walter Frederick",
++      "alternate_names": []
+     },
+     {
+-      "name": "Conference on Civil Engineering Problems Overseas",
+-      "entity_type": "event"
++      "entity_type": "event",
++      "name": "Conference on Civil Engineering Problems Overseas"
+     }
+   ],
+   "by_statement": "[by] J.W.F. Dowling, F.H.P. Williams",
+@@ -24,4 +27,4 @@
+     "Williams, Frederik Harry Paston",
+     "Conference on Civil Engineering Problems Overseas (1964)"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/thewilliamsrecord_vol29b_meta.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/thewilliamsrecord_vol29b_meta.json
+index fc1304037..6ced5d36a 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/thewilliamsrecord_vol29b_meta.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/thewilliamsrecord_vol29b_meta.json
+@@ -24,6 +24,13 @@
+   "publish_places": [
+     "Williamstown, Mass"
+   ],
+-  "subjects": ["College student newspapers and periodicals", "Periodicals", "Williams College"],
+-  "subject_places": ["Williamstown", "Massachusetts"]
+-}
++  "subjects": [
++    "College student newspapers and periodicals",
++    "Periodicals",
++    "Williams College"
++  ],
++  "subject_places": [
++    "Williamstown",
++    "Massachusetts"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/uoft_4351105_1626.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/uoft_4351105_1626.json
+index ca1404c10..c17dd1d28 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/uoft_4351105_1626.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/uoft_4351105_1626.json
+@@ -1,6 +1,6 @@
+ {
+   "other_titles": [
+-    "Pami\ufe20a\ufe21tniki mirovo\u012d \u0117stetichesko\u012d mysli."
++    "Pami︠a︡tniki mirovoĭ ėsteticheskoĭ mysli."
+   ],
+   "publishers": [
+     "Izd-vo akademii khudozhestv SSSR"
+@@ -13,21 +13,23 @@
+     },
+     {
+       "type": "/type/toc_item",
+-      "title": "Antichnost\u02b9 ; Srednie veka ; Vozrozhdenie -- -- t. 2."
++      "title": "Antichnostʹ ; Srednie veka ; Vozrozhdenie -- -- t. 2."
+     },
+     {
+       "type": "/type/toc_item",
+-      "title": "\u0116steticheskie uchenii\ufe20a\ufe21 XVII-XVIII vekov -- -- t. 3."
++      "title": "Ėsteticheskie uchenii︠a︡ XVII-XVIII vekov -- -- t. 3."
+     },
+     {
+       "type": "/type/toc_item",
+-      "title": "\u0116steticheskie uchenii\ufe20a\ufe21 zapadno\u012d Evropy i SSHA (1789-1871)."
++      "title": "Ėsteticheskie uchenii︠a︡ zapadnoĭ Evropy i SSHA (1789-1871)."
+     }
+   ],
+-  "subtitle": "pami\ufe20a\ufe21tniki mirovo\u012d \u0117stetichesko\u012d mysli",
+-  "title": "Istorii\ufe20a\ufe21 \u0117stetiki",
++  "subtitle": "pami︠a︡tniki mirovoĭ ėsteticheskoĭ mysli",
++  "title": "Istorii︠a︡ ėstetiki",
+   "notes": "Includes bibliographical references.",
+-  "languages": ["rus"],
++  "languages": [
++    "rus"
++  ],
+   "lc_classifications": [
+     "BH81 .A55 1962"
+   ],
+@@ -35,19 +37,23 @@
+   "publish_country": "ru",
+   "authors": [
+     {
+-      "personal_name": "Ovsi\ufe20a\ufe21nnikov, Mikhail Fedotovich",
+-      "name": "Ovsi\ufe20a\ufe21nnikov, Mikhail Fedotovich",
+-      "entity_type": "person"
++      "name": "Ovsi︠a︡nnikov, Mikhail Fedotovich",
++      "entity_type": "person",
++      "personal_name": "Ovsi︠a︡nnikov, Mikhail Fedotovich",
++      "alternate_names": []
+     }
+   ],
+-  "by_statement": "Nauchno-issledovatel\u02b9ski\u012d institut teorii i istorii izobrazitel'nykh iskusstv",
++  "by_statement": "Nauchno-issledovatelʹskiĭ institut teorii i istorii izobrazitel'nykh iskusstv",
+   "publish_places": [
+     "Moskva"
+   ],
+   "contributions": [
+-    "Akademii\ufe20a\ufe21 khudozhestv SSSR",
+-    "Institut teorii i istorii izobrazitel\u02b9nykh iskusstv (Akademii\ufe20a\ufe21 khudozhestv SSSR)",
+-    "Nauchno-issledovatel\u02b9ski\u012d institut teorii i istorii izobrazitel\u02b9nykh iskusstv (Rossi\u012dskai\ufe20a\ufe21 akademii\ufe20a\ufe21 khudozhestv)"
++    "Akademii︠a︡ khudozhestv SSSR",
++    "Institut teorii i istorii izobrazitelʹnykh iskusstv (Akademii︠a︡ khudozhestv SSSR)",
++    "Nauchno-issledovatelʹskiĭ institut teorii i istorii izobrazitelʹnykh iskusstv (Rossiĭskai︠a︡ akademii︠a︡ khudozhestv)"
+   ],
+-  "subjects": ["Aesthetics", "History and criticism"]
+-}
++  "subjects": [
++    "Aesthetics",
++    "History and criticism"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/upei_broken_008.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/upei_broken_008.json
+index 7c29a7f55..bd3990978 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/upei_broken_008.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/upei_broken_008.json
+@@ -18,15 +18,20 @@
+   "authors": [
+     {
+       "birth_date": "1922",
+-      "personal_name": "Bowen, Elenore Smith",
+       "name": "Bowen, Elenore Smith",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Bowen, Elenore Smith",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "by Elenore Smith Bowen",
+   "publish_places": [
+     "Garden City, N. Y"
+   ],
+-  "subjects": ["Social life and customs"],
+-  "subject_places": ["West Africa"]
+-}
++  "subjects": [
++    "Social life and customs"
++  ],
++  "subject_places": [
++    "West Africa"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/upei_short_008.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/upei_short_008.json
+index aa9f00d76..af33081d0 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/upei_short_008.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/upei_short_008.json
+@@ -12,10 +12,18 @@
+   ],
+   "authors": [
+     {
+-      "name": "Charlottetown Area Industrial Commission",
+-      "entity_type": "org"
++      "entity_type": "org",
++      "name": "Charlottetown Area Industrial Commission"
+     }
+   ],
+-  "subjects": ["Social conditions", "Economic conditions", "Guidebooks", "Description and travel"],
+-  "subject_places": ["Charlottetown (P.E.I.)", "Prince Edward Island"]
+-}
++  "subjects": [
++    "Social conditions",
++    "Economic conditions",
++    "Guidebooks",
++    "Description and travel"
++  ],
++  "subject_places": [
++    "Charlottetown (P.E.I.)",
++    "Prince Edward Island"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/warofrebellionco1473unit_meta.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/warofrebellionco1473unit_meta.json
+index 994199964..9b6918d46 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/warofrebellionco1473unit_meta.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/warofrebellionco1473unit_meta.json
+@@ -13,7 +13,9 @@
+   ],
+   "notes": "Found also in the House Miscellaneous documents of the 52d to the 56th Congress.\n\nEach number has special index. Inserted in each volume: Additions and corrections ... Washington, Govt. Print. Off., 1902.\n\nSeries 1, v. 1-53, series 3, v. 1-5, and series 4, v. 1-3 include \"Alternate designations of organizations mentioned.\"\n\nVol. 54-55 of series 1 [serial no. 112-113] \"have not been published, and no material for them is in hand.\"  cf. General index, p. xi. Series 2, v. 1 [serial no. 114] with imprint 1894, was not issued until 1898.\n\nEdited in the War Records Office, 1880-July 1899; in the Record and Pension Office, July 1899-1901.\n\nRobert N. Scott compiled and edited v. 1-18, 1880-87, and also collected the greater part of the material for v. 19-36, 1887-91. After his death in 1887 the work was continued by Henry M. Lazelle, 1887-89, and by a board of publication, 1889-99, consisting of George B. Davis, 1889-97, Leslie J. Perry, 1889-99, Joseph W. Kirkley, 1889-99, and Fred C. Ainsworth, 1898-99; from 1899-1901 edited by Fred C. Ainsworth and Joesph W. Kirkley.\n\nSome volumes are 1985 reprints by National Historical Society.",
+   "number_of_pages": 128,
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "lc_classifications": [
+     "E464 .U6"
+   ],
+@@ -21,8 +23,8 @@
+   "publish_country": "dcu",
+   "authors": [
+     {
+-      "name": "United States. War Dept.",
+-      "entity_type": "org"
++      "entity_type": "org",
++      "name": "United States. War Dept."
+     }
+   ],
+   "by_statement": "prepared under the direction of the Secretary of War",
+@@ -42,7 +44,16 @@
+     "United States. Record and Pension Office",
+     "United States. Congress. House"
+   ],
+-  "subjects": ["Sources", "Regimental histories", "History"],
+-  "subject_places": ["United States", "Confederate States of America"],
+-  "subject_times": ["Civil War, 1861-1865"]
+-}
++  "subjects": [
++    "Sources",
++    "Regimental histories",
++    "History"
++  ],
++  "subject_places": [
++    "United States",
++    "Confederate States of America"
++  ],
++  "subject_times": [
++    "Civil War, 1861-1865"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/wrapped_lines.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/wrapped_lines.json
+index b89761382..44ef569e5 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/wrapped_lines.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/wrapped_lines.json
+@@ -6,7 +6,9 @@
+   "title": "Selected Executive Session Hearings of the Committee, 1951-56; Volume XIV: U.S. Foreign Policy and the East-West Confrontation",
+   "notes": "\"[pub. 1980.].\"\n\nRecord is based on bibliographic data in CIS US Congressional Committee Hearings Index. Reuse except for individual research requires license from Congressional Information Service, Inc.\n\nIndexed in CIS US Congressional Committee Hearings Index Part V\n\nMicrofiche. [Bethesda, Md.] : Congressional Information Service 1983. 11 x 15 cm.",
+   "number_of_pages": 605,
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "publishers": [
+     "U.S. G.P.O."
+   ],
+@@ -14,8 +16,8 @@
+   "publish_country": "mdu",
+   "authors": [
+     {
+-      "name": "United States. Congress. House. Committee on Foreign Affairs",
+-      "entity_type": "org"
++      "entity_type": "org",
++      "name": "United States. Congress. House. Committee on Foreign Affairs"
+     }
+   ],
+   "oclc_numbers": [
+@@ -32,6 +34,12 @@
+   "location": [
+     "BIN"
+   ],
+-  "subjects": ["United States", "Foreign relations", "United States. Congress. House. Committee on Foreign Affairs"],
+-  "subject_places": ["United States"]
+-}
++  "subjects": [
++    "United States",
++    "Foreign relations",
++    "United States. Congress. House. Committee on Foreign Affairs"
++  ],
++  "subject_places": [
++    "United States"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/wwu_51323556.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/wwu_51323556.json
+index 3b75ce5ab..acc5b6bd8 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/wwu_51323556.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/wwu_51323556.json
+@@ -46,11 +46,11 @@
+     },
+     {
+       "type": "/type/toc_item",
+-      "title": "Munroe Eagles, Paul B\u00e9langer, and Hugh W. Calkins. Region-level analysis. Mapping social exclusion and inclusion in developing countries : spatial patterns of S\u00e0o Paulo in the 1990s"
++      "title": "Munroe Eagles, Paul Bélanger, and Hugh W. Calkins. Region-level analysis. Mapping social exclusion and inclusion in developing countries : spatial patterns of Sào Paulo in the 1990s"
+     },
+     {
+       "type": "/type/toc_item",
+-      "title": "Gilberto C\u01cemara, Aldaiza Sposati, Dirce Koga, Antonio Miguel Monteiro, Frederico Roman Ramos, Eduardo Camargo, and Suzana Druck Fuks. Business location and spatial externalities : tying concepts to measures"
++      "title": "Gilberto Cǎmara, Aldaiza Sposati, Dirce Koga, Antonio Miguel Monteiro, Frederico Roman Ramos, Eduardo Camargo, and Suzana Druck Fuks. Business location and spatial externalities : tying concepts to measures"
+     },
+     {
+       "type": "/type/toc_item",
+@@ -111,7 +111,9 @@
+   "isbn_13": [
+     "9780195152708"
+   ],
+-  "languages": ["eng"],
++  "languages": [
++    "eng"
++  ],
+   "lc_classifications": [
+     "HA30.6 .S665 2004"
+   ],
+@@ -119,15 +121,17 @@
+   "publish_country": "enk",
+   "authors": [
+     {
+-      "personal_name": "Goodchild, Michael F.",
+       "name": "Goodchild, Michael F.",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Goodchild, Michael F.",
++      "alternate_names": []
+     },
+     {
+       "birth_date": "1940",
+-      "personal_name": "Janelle, Donald G.",
+       "name": "Janelle, Donald G.",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Janelle, Donald G.",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "edited by  Michael F. Goodchild, Donald G. Janelle",
+@@ -141,5 +145,9 @@
+   "isbn_10": [
+     "0195152700"
+   ],
+-  "subjects": ["Statistical methods", "Spatial analysis (Statistics)", "Population geography"]
+-}
++  "subjects": [
++    "Statistical methods",
++    "Spatial analysis (Statistics)",
++    "Population geography"
++  ]
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/bin_expect/zweibchersatir01horauoft_meta.json b/openlibrary/catalog/marc/tests/test_data/bin_expect/zweibchersatir01horauoft_meta.json
+index f6fddbdcc..b076f7aa6 100644
+--- a/openlibrary/catalog/marc/tests/test_data/bin_expect/zweibchersatir01horauoft_meta.json
++++ b/openlibrary/catalog/marc/tests/test_data/bin_expect/zweibchersatir01horauoft_meta.json
+@@ -6,24 +6,28 @@
+   "table_of_contents": [
+     {
+       "type": "/type/toc_item",
+-      "title": "Vol. 1. Text, \u00dcbersetzung und kritischer Apparat.-  Vol. 2, pt. 1, Commentar zum ersten Buche der Satiren.-  Vol. 2, pt. 2, Commentar zum zweiten Buche der Satiren, verfasst von W.S. Teuffel."
++      "title": "Vol. 1. Text, Übersetzung und kritischer Apparat.-  Vol. 2, pt. 1, Commentar zum ersten Buche der Satiren.-  Vol. 2, pt. 2, Commentar zum zweiten Buche der Satiren, verfasst von W.S. Teuffel."
+     }
+   ],
+-  "title": "Zwei B\u00fccher Satiren",
++  "title": "Zwei Bücher Satiren",
+   "work_titles": [
+     "Satirae"
+   ],
+-  "languages": ["ger", "lat"],
++  "languages": [
++    "ger",
++    "lat"
++  ],
+   "publish_date": "1854",
+   "publish_country": "ge",
+   "authors": [
+     {
+-      "personal_name": "Horace",
+       "name": "Horace",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Horace",
++      "alternate_names": []
+     }
+   ],
+-  "by_statement": "aus dreissig unverglichenen und allen bisher verglichenen Handschriften, wie auch s\u00e4mmtlichen bedeutenden Ausgaben kritisch hergestellt, metrisch \u00fcbersetzt, und mit erkl\u00e4rendem Commentar versehen von C. Kirchner",
++  "by_statement": "aus dreissig unverglichenen und allen bisher verglichenen Handschriften, wie auch sämmtlichen bedeutenden Ausgaben kritisch hergestellt, metrisch übersetzt, und mit erklärendem Commentar versehen von C. Kirchner",
+   "publish_places": [
+     "Leipzig"
+   ],
+@@ -31,4 +35,4 @@
+     "Kirchner, Carl Christian Jacob, 1787-1855, tr. [and] ed",
+     "Teuffel, Wilhelm Sigmund, 1820-1878"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/xml_expect/00schlgoog.json b/openlibrary/catalog/marc/tests/test_data/xml_expect/00schlgoog.json
+index 91988fc54..7b86b2d61 100644
+--- a/openlibrary/catalog/marc/tests/test_data/xml_expect/00schlgoog.json
++++ b/openlibrary/catalog/marc/tests/test_data/xml_expect/00schlgoog.json
+@@ -16,12 +16,13 @@
+   "publish_country": "fr",
+   "authors": [
+     {
+-      "name": "Yehudai ben Na\u1e25man gaon",
++      "date": "8th century",
++      "name": "Yehudai ben Naḥman gaon",
++      "entity_type": "person",
++      "personal_name": "Yehudai ben Naḥman",
+       "title": "gaon",
+-      "personal_name": "Yehudai ben Na\u1e25man",
+       "role": "supposed author",
+-      "date": "8th century",
+-      "entity_type": "person"
++      "alternate_names": []
+     }
+   ],
+   "publish_places": [
+@@ -33,4 +34,4 @@
+   "subjects": [
+     "Jewish law"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/xml_expect/0descriptionofta1682unit.json b/openlibrary/catalog/marc/tests/test_data/xml_expect/0descriptionofta1682unit.json
+index 4cb038820..060a1a0f9 100644
+--- a/openlibrary/catalog/marc/tests/test_data/xml_expect/0descriptionofta1682unit.json
++++ b/openlibrary/catalog/marc/tests/test_data/xml_expect/0descriptionofta1682unit.json
+@@ -23,8 +23,8 @@
+   "publish_country": "dcu",
+   "authors": [
+     {
+-      "name": "United States. Congress. Senate. Committee on Finance. Subcommittee on Estate and Gift Taxation",
+-      "entity_type": "org"
++      "entity_type": "org",
++      "name": "United States. Congress. Senate. Committee on Finance. Subcommittee on Estate and Gift Taxation"
+     }
+   ],
+   "by_statement": "prepared by the staff of the Joint Committee on Taxation",
+diff --git a/openlibrary/catalog/marc/tests/test_data/xml_expect/13dipolarcycload00burk.json b/openlibrary/catalog/marc/tests/test_data/xml_expect/13dipolarcycload00burk.json
+index 439d06a3b..8396a43db 100644
+--- a/openlibrary/catalog/marc/tests/test_data/xml_expect/13dipolarcycload00burk.json
++++ b/openlibrary/catalog/marc/tests/test_data/xml_expect/13dipolarcycload00burk.json
+@@ -16,9 +16,10 @@
+   "authors": [
+     {
+       "birth_date": "1954",
+-      "personal_name": "Burkholder, Conrad",
+       "name": "Burkholder, Conrad",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Burkholder, Conrad",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "by Conrad Burkholder",
+@@ -28,4 +29,4 @@
+   "location": [
+     "FU"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/xml_expect/1733mmoiresdel00vill.json b/openlibrary/catalog/marc/tests/test_data/xml_expect/1733mmoiresdel00vill.json
+index 468fcb4fd..239a12d94 100644
+--- a/openlibrary/catalog/marc/tests/test_data/xml_expect/1733mmoiresdel00vill.json
++++ b/openlibrary/catalog/marc/tests/test_data/xml_expect/1733mmoiresdel00vill.json
+@@ -3,8 +3,8 @@
+     "Jose"
+   ],
+   "pagination": "[viii], 371 p.",
+-  "subtitle": "o\u00f9 l'on verra les minist\u00e8res de Dom Juan [et] du Duc de Medina Celi, et diverses choses oncernant la monarchie Espaagnole",
+-  "title": "M\u00e9moires de la cour d'Espagne, dupuis l'ann\u00e9e 1679, jusqu'en 1681",
++  "subtitle": "où l'on verra les ministères de Dom Juan [et] du Duc de Medina Celi, et diverses choses oncernant la monarchie Espaagnole",
++  "title": "Mémoires de la cour d'Espagne, dupuis l'année 1679, jusqu'en 1681",
+   "number_of_pages": 371,
+   "languages": [
+     "fre"
+@@ -20,15 +20,16 @@
+   "publish_country": "fr",
+   "authors": [
+     {
++      "birth_date": "1623",
+       "death_date": "1698",
+       "name": "Villars, Pierre marquis de",
+-      "title": "marquis de",
++      "entity_type": "person",
+       "personal_name": "Villars, Pierre",
+-      "birth_date": "1623",
+-      "entity_type": "person"
++      "title": "marquis de",
++      "alternate_names": []
+     }
+   ],
+   "publish_places": [
+     "Paris"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/xml_expect/39002054008678.yale.edu.json b/openlibrary/catalog/marc/tests/test_data/xml_expect/39002054008678.yale.edu.json
+index ce245152f..94e0d9204 100644
+--- a/openlibrary/catalog/marc/tests/test_data/xml_expect/39002054008678.yale.edu.json
++++ b/openlibrary/catalog/marc/tests/test_data/xml_expect/39002054008678.yale.edu.json
+@@ -22,10 +22,11 @@
+   "authors": [
+     {
+       "birth_date": "1842",
+-      "personal_name": "Conant, Thomas",
+       "death_date": "1905",
+       "name": "Conant, Thomas",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Conant, Thomas",
++      "alternate_names": []
+     }
+   ],
+   "publish_places": [
+diff --git a/openlibrary/catalog/marc/tests/test_data/xml_expect/bijouorannualofl1828cole.json b/openlibrary/catalog/marc/tests/test_data/xml_expect/bijouorannualofl1828cole.json
+index 7afb9a238..f719177f7 100644
+--- a/openlibrary/catalog/marc/tests/test_data/xml_expect/bijouorannualofl1828cole.json
++++ b/openlibrary/catalog/marc/tests/test_data/xml_expect/bijouorannualofl1828cole.json
+@@ -20,10 +20,11 @@
+   "authors": [
+     {
+       "birth_date": "1772",
+-      "personal_name": "Coleridge, Samuel Taylor",
+       "death_date": "1834",
+       "name": "Coleridge, Samuel Taylor",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Coleridge, Samuel Taylor",
++      "alternate_names": []
+     }
+   ],
+   "publish_places": [
+@@ -32,4 +33,4 @@
+   "contributions": [
+     "Lamb, Charles, 1775-1834"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/xml_expect/cu31924091184469.json b/openlibrary/catalog/marc/tests/test_data/xml_expect/cu31924091184469.json
+index fcb2606ed..e5584c848 100644
+--- a/openlibrary/catalog/marc/tests/test_data/xml_expect/cu31924091184469.json
++++ b/openlibrary/catalog/marc/tests/test_data/xml_expect/cu31924091184469.json
+@@ -22,9 +22,10 @@
+   "publish_country": "nyu",
+   "authors": [
+     {
+-      "personal_name": "Homer",
+       "name": "Homer",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Homer",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "literally translated, with explanatory notes, by Theodore Alois Buckley",
+diff --git a/openlibrary/catalog/marc/tests/test_data/xml_expect/engineercorpsofh00sher.json b/openlibrary/catalog/marc/tests/test_data/xml_expect/engineercorpsofh00sher.json
+index ce6579299..0e2b42fdf 100644
+--- a/openlibrary/catalog/marc/tests/test_data/xml_expect/engineercorpsofh00sher.json
++++ b/openlibrary/catalog/marc/tests/test_data/xml_expect/engineercorpsofh00sher.json
+@@ -19,10 +19,11 @@
+   "authors": [
+     {
+       "birth_date": "1829",
+-      "personal_name": "Sherman, Edwin Allen",
+       "death_date": "1914",
+       "name": "Sherman, Edwin Allen",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Sherman, Edwin Allen",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "Compiled and translated by Edwin A. Sherman",
+diff --git a/openlibrary/catalog/marc/tests/test_data/xml_expect/flatlandromanceo00abbouoft.json b/openlibrary/catalog/marc/tests/test_data/xml_expect/flatlandromanceo00abbouoft.json
+index 8354a68ac..8b2710f17 100644
+--- a/openlibrary/catalog/marc/tests/test_data/xml_expect/flatlandromanceo00abbouoft.json
++++ b/openlibrary/catalog/marc/tests/test_data/xml_expect/flatlandromanceo00abbouoft.json
+@@ -16,10 +16,11 @@
+   "authors": [
+     {
+       "birth_date": "1838",
+-      "personal_name": "Abbott, Edwin Abbott",
+       "death_date": "1926",
+       "name": "Abbott, Edwin Abbott",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Abbott, Edwin Abbott",
++      "alternate_names": []
+     }
+   ],
+   "by_statement": "by A. Square ; with illustrations by the author",
+diff --git a/openlibrary/catalog/marc/tests/test_data/xml_expect/nybc200247.json b/openlibrary/catalog/marc/tests/test_data/xml_expect/nybc200247.json
+index e0769ac6a..be62ecc8d 100644
+--- a/openlibrary/catalog/marc/tests/test_data/xml_expect/nybc200247.json
++++ b/openlibrary/catalog/marc/tests/test_data/xml_expect/nybc200247.json
+@@ -4,17 +4,17 @@
+     "Centennial of the historian Shimen Dubnow"
+   ],
+   "publishers": [
+-    "I\u1e33uf"
++    "Iḳuf"
+   ],
+   "pagination": "92 p.",
+   "table_of_contents": [
+     {
+       "type": "/type/toc_item",
+-      "title": "Ar\u1e6di\u1e33len vegn Shimen Dubnov"
++      "title": "Arṭiḳlen vegn Shimen Dubnov"
+     },
+     {
+       "type": "/type/toc_item",
+-      "title": "Ophandlungen un ar\u1e6di\u1e33len fun Shimen Dubnov"
++      "title": "Ophandlungen un arṭiḳlen fun Shimen Dubnov"
+     },
+     {
+       "type": "/type/toc_item",
+@@ -22,7 +22,7 @@
+     }
+   ],
+   "subtitle": "zamlung",
+-  "title": "Tsum hunderts\u1e6dn geboyrn\u1e6dog fun Shimon Dubno\u1e7f",
++  "title": "Tsum hundertsṭn geboyrnṭog fun Shimon Dubnoṿ",
+   "series": [
+     "Steven Spielberg digital Yiddish library -- no. 00247"
+   ],
+@@ -41,20 +41,21 @@
+   "authors": [
+     {
+       "birth_date": "1860",
+-      "personal_name": "Dubnow, Simon",
+       "death_date": "1941",
+       "name": "Dubnow, Simon",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Dubnow, Simon",
++      "alternate_names": []
+     }
+   ],
+   "subject_people": [
+     "Simon Dubnow (1860-1941)"
+   ],
+   "publish_places": [
+-    "Nyu-Yor\u1e33"
++    "Nyu-Yorḳ"
+   ],
+   "contributions": [
+     "Mayzel, Nachman, 1887-1966"
+   ],
+-  "by_statement": "tsunoyfgesh.tel\u1e6d un reda\u1e33\u1e6dir\u1e6d fun Na\u1e25man Mayzil"
+-}
++  "by_statement": "tsunoyfgesh.telṭ un redaḳṭirṭ fun Naḥman Mayzil"
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/xml_expect/onquietcomedyint00brid.json b/openlibrary/catalog/marc/tests/test_data/xml_expect/onquietcomedyint00brid.json
+index bc8ed71cc..cba849da3 100644
+--- a/openlibrary/catalog/marc/tests/test_data/xml_expect/onquietcomedyint00brid.json
++++ b/openlibrary/catalog/marc/tests/test_data/xml_expect/onquietcomedyint00brid.json
+@@ -19,12 +19,13 @@
+   "publish_country": "mau",
+   "authors": [
+     {
+-      "personal_name": "Bridgham, Gladys Ruth",
+       "name": "Bridgham, Gladys Ruth",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Bridgham, Gladys Ruth",
++      "alternate_names": []
+     }
+   ],
+   "publish_places": [
+     "Boston"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/xml_expect/secretcodeofsucc00stjo.json b/openlibrary/catalog/marc/tests/test_data/xml_expect/secretcodeofsucc00stjo.json
+index 6e56cf84a..dc1e18d35 100644
+--- a/openlibrary/catalog/marc/tests/test_data/xml_expect/secretcodeofsucc00stjo.json
++++ b/openlibrary/catalog/marc/tests/test_data/xml_expect/secretcodeofsucc00stjo.json
+@@ -77,9 +77,10 @@
+   "authors": [
+     {
+       "birth_date": "1967",
+-      "personal_name": "St. John, Noah",
+       "name": "St. John, Noah",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "St. John, Noah",
++      "alternate_names": []
+     }
+   ],
+   "subtitle": "7 hidden steps to more wealth and happiness",
+diff --git a/openlibrary/catalog/marc/tests/test_data/xml_expect/soilsurveyrepor00statgoog.json b/openlibrary/catalog/marc/tests/test_data/xml_expect/soilsurveyrepor00statgoog.json
+index d81c5cfdb..2654cc7f0 100644
+--- a/openlibrary/catalog/marc/tests/test_data/xml_expect/soilsurveyrepor00statgoog.json
++++ b/openlibrary/catalog/marc/tests/test_data/xml_expect/soilsurveyrepor00statgoog.json
+@@ -17,8 +17,8 @@
+   "publish_country": "iau",
+   "authors": [
+     {
+-      "name": "Iowa. Agricultural and Home Economics Experiment Station, Ames. [from old catalog]",
+-      "entity_type": "org"
++      "entity_type": "org",
++      "name": "Iowa. Agricultural and Home Economics Experiment Station, Ames. [from old catalog]"
+     }
+   ],
+   "publish_places": [
+@@ -27,4 +27,4 @@
+   "subjects": [
+     "Soil surveys"
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/openlibrary/catalog/marc/tests/test_data/xml_expect/warofrebellionco1473unit.json b/openlibrary/catalog/marc/tests/test_data/xml_expect/warofrebellionco1473unit.json
+index ed7241a9d..84db43b00 100644
+--- a/openlibrary/catalog/marc/tests/test_data/xml_expect/warofrebellionco1473unit.json
++++ b/openlibrary/catalog/marc/tests/test_data/xml_expect/warofrebellionco1473unit.json
+@@ -27,8 +27,8 @@
+   "publish_country": "dcu",
+   "authors": [
+     {
+-      "name": "United States. War Dept.",
+-      "entity_type": "org"
++      "entity_type": "org",
++      "name": "United States. War Dept."
+     }
+   ],
+   "publish_places": [
+diff --git a/openlibrary/catalog/marc/tests/test_data/xml_expect/zweibchersatir01horauoft.json b/openlibrary/catalog/marc/tests/test_data/xml_expect/zweibchersatir01horauoft.json
+index c9fa9a56e..b076f7aa6 100644
+--- a/openlibrary/catalog/marc/tests/test_data/xml_expect/zweibchersatir01horauoft.json
++++ b/openlibrary/catalog/marc/tests/test_data/xml_expect/zweibchersatir01horauoft.json
+@@ -6,10 +6,10 @@
+   "table_of_contents": [
+     {
+       "type": "/type/toc_item",
+-      "title": "Vol. 1. Text, \u00dcbersetzung und kritischer Apparat.-  Vol. 2, pt. 1, Commentar zum ersten Buche der Satiren.-  Vol. 2, pt. 2, Commentar zum zweiten Buche der Satiren, verfasst von W.S. Teuffel."
++      "title": "Vol. 1. Text, Übersetzung und kritischer Apparat.-  Vol. 2, pt. 1, Commentar zum ersten Buche der Satiren.-  Vol. 2, pt. 2, Commentar zum zweiten Buche der Satiren, verfasst von W.S. Teuffel."
+     }
+   ],
+-  "title": "Zwei B\u00fccher Satiren",
++  "title": "Zwei Bücher Satiren",
+   "work_titles": [
+     "Satirae"
+   ],
+@@ -21,12 +21,13 @@
+   "publish_country": "ge",
+   "authors": [
+     {
+-      "personal_name": "Horace",
+       "name": "Horace",
+-      "entity_type": "person"
++      "entity_type": "person",
++      "personal_name": "Horace",
++      "alternate_names": []
+     }
+   ],
+-  "by_statement": "aus dreissig unverglichenen und allen bisher verglichenen Handschriften, wie auch s\u00e4mmtlichen bedeutenden Ausgaben kritisch hergestellt, metrisch \u00fcbersetzt, und mit erkl\u00e4rendem Commentar versehen von C. Kirchner",
++  "by_statement": "aus dreissig unverglichenen und allen bisher verglichenen Handschriften, wie auch sämmtlichen bedeutenden Ausgaben kritisch hergestellt, metrisch übersetzt, und mit erklärendem Commentar versehen von C. Kirchner",
+   "publish_places": [
+     "Leipzig"
+   ],
+@@ -34,4 +35,4 @@
+     "Kirchner, Carl Christian Jacob, 1787-1855, tr. [and] ed",
+     "Teuffel, Wilhelm Sigmund, 1820-1878"
+   ]
+-}
++}
+\ No newline at end of file

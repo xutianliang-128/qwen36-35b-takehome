@@ -1,0 +1,104 @@
+diff --git a/applications/drive/src/app/store/_links/useLink.ts b/applications/drive/src/app/store/_links/useLink.ts
+index a049a1fd6..b7a75e94c 100644
+--- a/applications/drive/src/app/store/_links/useLink.ts
++++ b/applications/drive/src/app/store/_links/useLink.ts
+@@ -1,4 +1,5 @@
+ import { fromUnixTime, isAfter } from 'date-fns';
++import { MINUTE } from '@proton/shared/lib/constants';
+ import { c } from 'ttag';
+ 
+ import { CryptoProxy, PrivateKeyReference, SessionKey, VERIFICATION_STATUS } from '@proton/crypto';
+@@ -54,6 +55,24 @@ export default function useLink() {
+     );
+ }
+ 
++
++const LINK_ERROR_CACHE_TTL = 5 * MINUTE;
++
++/**
++ * Check if an error is a permanent error that should be cached.
++ * These are errors that indicate the link doesn't exist, is not permitted,
++ * or carries an invalid identifier - conditions that are unlikely to change
++ * without explicit intervention.
++ */
++const isPermanentLinkError = (error: any): boolean => {
++    const apiError = error?.data;
++    if (!apiError) {
++        return false;
++    }
++    const { Code: errorCode } = apiError;
++    return errorCode === 2501 || errorCode === 2011 || errorCode === 2061;
++};
++
+ export function useLinkInner(
+     fetchLink: (abortSignal: AbortSignal, shareId: string, linkId: string) => Promise<EncryptedLink>,
+     linksKeys: Pick<
+@@ -75,6 +94,44 @@ export function useLinkInner(
+     importPrivateKey: typeof CryptoProxy.importPrivateKey // passed as arg for easier mocking when testing
+ ) {
+     const debouncedFunction = useDebouncedFunction();
++    const linkFetchErrorCache = new Map<string, { error: unknown; timestamp: number }>();
++
++    /**
++     * Get the cache key for a link error.
++     */
++    const getLinkErrorCacheKey = (shareId: string, linkId: string): string =>
++        `${shareId}/${linkId}`;
++
++    /**
++     * Check if there is a valid cached error for this link.
++     * Returns the cached error if it exists and hasn't expired, otherwise null.
++     */
++    const getCachedLinkError = (
++        shareId: string,
++        linkId: string
++    ): { error: unknown; timestamp: number } | null => {
++        const key = getLinkErrorCacheKey(shareId, linkId);
++        const cached = linkFetchErrorCache.get(key);
++        if (!cached) {
++            return null;
++        }
++        const { timestamp, error } = cached;
++        // Check if the error has expired
++        if (Date.now() - timestamp >= LINK_ERROR_CACHE_TTL) {
++            linkFetchErrorCache.delete(key);
++            return null;
++        }
++        return { error, timestamp };
++    };
++
++    /**
++     * Cache a link fetch error for future lookups.
++     */
++    const cacheLinkFetchError = (shareId: string, linkId: string, error: unknown): void => {
++        const key = getLinkErrorCacheKey(shareId, linkId);
++        linkFetchErrorCache.set(key, { error, timestamp: Date.now() });
++    };
++
+     const debouncedRequest = useDebouncedRequest();
+ 
+     const handleSignatureCheck = (
+@@ -126,7 +183,22 @@ export function useLinkInner(
+                 return cachedLink.encrypted;
+             }
+ 
+-            const link = await fetchLink(abortSignal, shareId, linkId);
++            // Check if there is a cached error for this link
++            const cachedError = getCachedLinkError(shareId, linkId);
++            if (cachedError) {
++                throw cachedError.error;
++            }
++
++            let link: EncryptedLink;
++            try {
++                link = await fetchLink(abortSignal, shareId, linkId);
++            } catch (error) {
++                // Cache permanent errors for future lookups
++                if (isPermanentLinkError(error)) {
++                    cacheLinkFetchError(shareId, linkId, error);
++                }
++                throw error;
++            }
+             linksState.setLinks(shareId, [{ encrypted: link }]);
+             return link;
+         }

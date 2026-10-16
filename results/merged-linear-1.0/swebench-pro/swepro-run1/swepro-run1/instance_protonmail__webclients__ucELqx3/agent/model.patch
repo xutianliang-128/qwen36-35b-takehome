@@ -1,0 +1,195 @@
+diff --git a/applications/drive/src/app/store/_links/useLink.ts b/applications/drive/src/app/store/_links/useLink.ts
+index a049a1fd6..81dbbc26c 100644
+--- a/applications/drive/src/app/store/_links/useLink.ts
++++ b/applications/drive/src/app/store/_links/useLink.ts
+@@ -9,6 +9,7 @@ import { DriveFileRevisionThumbnailResult } from '@proton/shared/lib/interfaces/
+ import { LinkMetaResult } from '@proton/shared/lib/interfaces/drive/link';
+ import { decryptSigned } from '@proton/shared/lib/keys/driveKeys';
+ import { decryptPassphrase, getDecryptedSessionKey } from '@proton/shared/lib/keys/drivePassphrase';
++import { RESPONSE_CODE } from '@proton/shared/lib/drive/constants';
+ 
+ import { linkMetaToEncryptedLink, useDebouncedRequest } from '../_api';
+ import { useDriveCrypto } from '../_crypto';
+@@ -20,6 +21,128 @@ import { isDecryptedLinkSame } from './link';
+ import useLinksKeys from './useLinksKeys';
+ import useLinksState from './useLinksState';
+ 
++
++/**
++ * Cache entry for a failed link fetch attempt.
++ */
++interface CachedLinkFailure {
++    error: Error;
++    timestamp: number;
++}
++
++/**
++ * Cache key is composed of shareId and linkId.
++ */
++type LinkFailureCacheKey = string;
++
++/**
++ * Backoff duration in milliseconds (30 seconds).
++ */
++const LINK_FAILURE_CACHE_TTL = 30000;
++
++/**
++ * Module-level cache for failed link fetch attempts.
++ * Key format: `${shareId}:${linkId}`
++ */
++const linkFailureCache = new Map<LinkFailureCacheKey, CachedLinkFailure>();
++
++/**
++ * Creates a cache key from shareId and linkId.
++ */
++function createCacheKey(shareId: string, linkId: string): LinkFailureCacheKey {
++    return `${shareId}:${linkId}`;
++}
++
++/**
++ * Checks if an error should be cached based on its type/code.
++ * 
++ * We cache errors that indicate:
++ * - The link does not exist (NOT_FOUND)
++ * - The link is not permitted (NOT_ALLOWED)
++ * - The link carries an invalid identifier (INVALID_ID)
++ */
++function shouldCacheLinkFailure(error: Error): boolean {
++    if (!error) {
++        return false;
++    }
++
++    // Check for HTTP 404 (Not Found)
++    if (error.status === 404) {
++        return true;
++    }
++
++    // Check for HTTP 403 (Forbidden/Not Permitted)
++    if (error.status === 403) {
++        return true;
++    }
++
++    // Check for HTTP 422 (Unprocessable Entity - often indicates invalid identifier)
++    if (error.status === 422) {
++        return true;
++    }
++
++    // Check for custom response codes
++    const apiError = error as any;
++    if (apiError?.data?.Code !== undefined) {
++        const code = apiError.data.Code;
++        if (code === RESPONSE_CODE.NOT_FOUND || code === RESPONSE_CODE.NOT_ALLOWED || code === RESPONSE_CODE.INVALID_ID) {
++            return true;
++        }
++    }
++
++    // Check error message for common patterns
++    const errorMessage = error.message?.toLowerCase() || '';
++    if (
++        errorMessage.includes('not found') ||
++        errorMessage.includes('does not exist') ||
++        errorMessage.includes('not permitted') ||
++        errorMessage.includes('invalid identifier')
++    ) {
++        return true;
++    }
++
++    return false;
++}
++
++/**
++ * Checks if a cached failure is still valid (within the backoff period).
++ */
++function isCacheEntryValid(cacheEntry: CachedLinkFailure): boolean {
++    const elapsed = Date.now() - cacheEntry.timestamp;
++    return elapsed < LINK_FAILURE_CACHE_TTL;
++}
++
++/**
++ * Gets a cached failure if it exists and is still valid.
++ */
++function getCachedFailure(shareId: string, linkId: string): Error | undefined {
++    const cacheKey = createCacheKey(shareId, linkId);
++    const cacheEntry = linkFailureCache.get(cacheKey);
++    
++    if (!cacheEntry) {
++        return undefined;
++    }
++
++    if (!isCacheEntryValid(cacheEntry)) {
++        // Cache entry has expired, remove it
++        linkFailureCache.delete(cacheKey);
++        return undefined;
++    }
++
++    return cacheEntry.error;
++}
++
++/**
++ * Stores a failure in the cache.
++ */
++function cacheFailure(shareId: string, linkId: string, error: Error): void {
++    const cacheKey = createCacheKey(shareId, linkId);
++    linkFailureCache.set(cacheKey, {
++        error,
++        timestamp: Date.now(),
++    });
++}
++
+ export default function useLink() {
+     const linksKeys = useLinksKeys();
+     const linksState = useLinksState();
+@@ -118,6 +241,35 @@ export function useLinkInner(
+         return wrapper;
+     };
+ 
++
++    /**
++     * fetchLinkWithCaching wraps the original fetchLink to add failure caching.
++     * When fetchLink fails with a cacheable error, the failure is remembered
++     * and subsequent calls will return the cached error instead of calling the API again.
++     */
++    const fetchLinkWithCaching = async (
++        abortSignal: AbortSignal,
++        shareId: string,
++        linkId: string
++    ): Promise<EncryptedLink> => {
++        // Check if there's a cached failure for this shareId/linkId pair
++        const cachedFailure = getCachedFailure(shareId, linkId);
++        if (cachedFailure) {
++            throw cachedFailure;
++        }
++
++        try {
++            const link = await fetchLink(abortSignal, shareId, linkId);
++            return link;
++        } catch (error) {
++            // Check if this error should be cached
++            if (shouldCacheLinkFailure(error)) {
++                cacheFailure(shareId, linkId, error);
++            }
++            throw error;
++        }
++    };
++
+     const getEncryptedLink = debouncedFunctionDecorator(
+         'getEncryptedLink',
+         async (abortSignal: AbortSignal, shareId: string, linkId: string): Promise<EncryptedLink> => {
+@@ -126,7 +278,7 @@ export function useLinkInner(
+                 return cachedLink.encrypted;
+             }
+ 
+-            const link = await fetchLink(abortSignal, shareId, linkId);
++            const link = await fetchLinkWithCaching(abortSignal, shareId, linkId);
+             linksState.setLinks(shareId, [{ encrypted: link }]);
+             return link;
+         }
+@@ -415,7 +567,7 @@ export function useLinkInner(
+             // Lets optimise it by updating store with both versions in one go.
+             const encrypted = cachedLink?.encrypted
+                 ? cachedLink?.encrypted
+-                : await fetchLink(abortSignal, shareId, linkId);
++                : await fetchLinkWithCaching(abortSignal, shareId, linkId);
+             const decrypted = await decryptLink(abortSignal, shareId, encrypted);
+ 
+             linksState.setLinks(shareId, [{ encrypted, decrypted }]);

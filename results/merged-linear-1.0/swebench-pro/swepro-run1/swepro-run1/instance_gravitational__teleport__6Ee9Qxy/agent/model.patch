@@ -1,0 +1,266 @@
+diff --git a/lib/kube/proxy/forwarder.go b/lib/kube/proxy/forwarder.go
+index 60887bf03..ff744dd8d 100644
+--- a/lib/kube/proxy/forwarder.go
++++ b/lib/kube/proxy/forwarder.go
+@@ -297,7 +297,6 @@ type authContext struct {
+ 	kubeUsers                map[string]struct{}
+ 	kubeCluster              string
+ 	teleportCluster          teleportClusterClient
+-	teleportClusterEndpoints []endpoint
+ 	recordingConfig          types.SessionRecordingConfig
+ 	// clientIdleTimeout sets information on client idle timeout
+ 	clientIdleTimeout time.Duration
+@@ -829,7 +828,7 @@ func (f *Forwarder) exec(ctx *authContext, w http.ResponseWriter, req *http.Requ
+ 				ServerID:        f.cfg.ServerID,
+ 				ServerNamespace: f.cfg.Namespace,
+ 				ServerHostname:  sess.teleportCluster.name,
+-				ServerAddr:      sess.teleportCluster.targetAddr,
++				ServerAddr:      sess.kubeAddress,
+ 			},
+ 			SessionMetadata: apievents.SessionMetadata{
+ 				SessionID: string(sessionID),
+@@ -842,7 +841,7 @@ func (f *Forwarder) exec(ctx *authContext, w http.ResponseWriter, req *http.Requ
+ 			},
+ 			ConnectionMetadata: apievents.ConnectionMetadata{
+ 				RemoteAddr: req.RemoteAddr,
+-				LocalAddr:  sess.teleportCluster.targetAddr,
++				LocalAddr:  sess.kubeAddress,
+ 				Protocol:   events.EventProtocolKube,
+ 			},
+ 			TerminalSize:              termParams.Serialize(),
+@@ -924,7 +923,7 @@ func (f *Forwarder) exec(ctx *authContext, w http.ResponseWriter, req *http.Requ
+ 				},
+ 				ConnectionMetadata: apievents.ConnectionMetadata{
+ 					RemoteAddr: req.RemoteAddr,
+-					LocalAddr:  sess.teleportCluster.targetAddr,
++					LocalAddr:  sess.kubeAddress,
+ 					Protocol:   events.EventProtocolKube,
+ 				},
+ 				// Bytes transmitted from user to pod.
+@@ -956,7 +955,7 @@ func (f *Forwarder) exec(ctx *authContext, w http.ResponseWriter, req *http.Requ
+ 				},
+ 				ConnectionMetadata: apievents.ConnectionMetadata{
+ 					RemoteAddr: req.RemoteAddr,
+-					LocalAddr:  sess.teleportCluster.targetAddr,
++					LocalAddr:  sess.kubeAddress,
+ 					Protocol:   events.EventProtocolKube,
+ 				},
+ 				Interactive: true,
+@@ -994,7 +993,7 @@ func (f *Forwarder) exec(ctx *authContext, w http.ResponseWriter, req *http.Requ
+ 				},
+ 				ConnectionMetadata: apievents.ConnectionMetadata{
+ 					RemoteAddr: req.RemoteAddr,
+-					LocalAddr:  sess.teleportCluster.targetAddr,
++					LocalAddr:  sess.kubeAddress,
+ 					Protocol:   events.EventProtocolKube,
+ 				},
+ 				CommandMetadata: apievents.CommandMetadata{
+@@ -1062,7 +1061,7 @@ func (f *Forwarder) portForward(ctx *authContext, w http.ResponseWriter, req *ht
+ 				Impersonator: ctx.Identity.GetIdentity().Impersonator,
+ 			},
+ 			ConnectionMetadata: apievents.ConnectionMetadata{
+-				LocalAddr:  sess.teleportCluster.targetAddr,
++				LocalAddr:  sess.kubeAddress,
+ 				RemoteAddr: req.RemoteAddr,
+ 				Protocol:   events.EventProtocolKube,
+ 			},
+@@ -1120,8 +1119,8 @@ func (f *Forwarder) setupForwardingHeaders(sess *clusterSession, req *http.Reque
+ 	// Setup scheme, override target URL to the destination address
+ 	req.URL.Scheme = "https"
+ 	req.RequestURI = req.URL.Path + "?" + req.URL.RawQuery
+-	req.URL.Host = sess.teleportCluster.targetAddr
+-	if sess.teleportCluster.targetAddr == "" {
++	req.URL.Host = sess.kubeAddress
++	if sess.kubeAddress == "" {
+ 		req.URL.Host = reversetunnel.LocalKubernetes
+ 	}
+ 
+@@ -1257,7 +1256,7 @@ func (f *Forwarder) catchAll(ctx *authContext, w http.ResponseWriter, req *http.
+ 		},
+ 		ConnectionMetadata: apievents.ConnectionMetadata{
+ 			RemoteAddr: req.RemoteAddr,
+-			LocalAddr:  sess.teleportCluster.targetAddr,
++			LocalAddr:  sess.kubeAddress,
+ 			Protocol:   events.EventProtocolKube,
+ 		},
+ 		ServerMetadata: apievents.ServerMetadata{
+@@ -1328,6 +1327,10 @@ func (f *Forwarder) getDialer(ctx authContext, sess *clusterSession, req *http.R
+ // clusterSession contains authenticated user session to the target cluster:
+ // x509 short lived credentials, forwarding proxies and other data
+ type clusterSession struct {
++	// kubeClusterEndpoints are candidate endpoints for the target kube cluster.
++	kubeClusterEndpoints []endpoint
++	// kubeAddress is the active connection address.
++	kubeAddress string
+ 	authContext
+ 	parent    *Forwarder
+ 	creds     *kubeCreds
+@@ -1389,20 +1392,20 @@ func (s *clusterSession) DialWithEndpoints(network, addr string) (net.Conn, erro
+ 
+ // This is separated from DialWithEndpoints for testing without monitorConn.
+ func (s *clusterSession) dialWithEndpoints(ctx context.Context, network, addr string) (net.Conn, error) {
+-	if len(s.teleportClusterEndpoints) == 0 {
++	if len(s.kubeClusterEndpoints) == 0 {
+ 		return nil, trace.BadParameter("no endpoints to dial")
+ 	}
+ 
+ 	// Shuffle endpoints to balance load
+-	shuffledEndpoints := make([]endpoint, len(s.teleportClusterEndpoints))
+-	copy(shuffledEndpoints, s.teleportClusterEndpoints)
++	shuffledEndpoints := make([]endpoint, len(s.kubeClusterEndpoints))
++	copy(shuffledEndpoints, s.kubeClusterEndpoints)
+ 	mathrand.Shuffle(len(shuffledEndpoints), func(i, j int) {
+ 		shuffledEndpoints[i], shuffledEndpoints[j] = shuffledEndpoints[j], shuffledEndpoints[i]
+ 	})
+ 
+ 	errs := []error{}
+ 	for _, endpoint := range shuffledEndpoints {
+-		s.teleportCluster.targetAddr = endpoint.addr
++		s.kubeAddress = endpoint.addr
+ 		s.teleportCluster.serverID = endpoint.serverID
+ 		conn, err := s.teleportCluster.DialWithContext(ctx, network, addr)
+ 		if err != nil {
+@@ -1414,18 +1417,31 @@ func (s *clusterSession) dialWithEndpoints(ctx context.Context, network, addr st
+ 	return nil, trace.NewAggregate(errs...)
+ }
+ 
++func (s *clusterSession) dial(ctx context.Context, network string) (net.Conn, error) {
++	if len(s.kubeClusterEndpoints) == 0 {
++		return nil, trace.BadParameter("no endpoints to dial")
++	}
++
++	return s.dialWithEndpoints(ctx, network, "")
++}
++
+ // TODO(awly): unit test this
+ func (f *Forwarder) newClusterSession(ctx authContext) (*clusterSession, error) {
+ 	if ctx.teleportCluster.isRemote {
+ 		return f.newClusterSessionRemoteCluster(ctx)
+ 	}
++	if ctx.kubeCluster == "" {
++		return nil, trace.NotFound("kubernetes cluster name is required")
++	}
+ 	return f.newClusterSessionSameCluster(ctx)
+ }
+ 
+ func (f *Forwarder) newClusterSessionRemoteCluster(ctx authContext) (*clusterSession, error) {
+ 	sess := &clusterSession{
+-		parent:      f,
+-		authContext: ctx,
++		parent:              f,
++		kubeClusterEndpoints: []endpoint{{addr: reversetunnel.LocalKubernetes}},
++		kubeAddress:         reversetunnel.LocalKubernetes,
++		authContext:         ctx,
+ 	}
+ 	var err error
+ 	sess.tlsConfig, err = f.getOrRequestClientCreds(ctx)
+@@ -1433,10 +1449,7 @@ func (f *Forwarder) newClusterSessionRemoteCluster(ctx authContext) (*clusterSes
+ 		f.log.Warningf("Failed to get certificate for %v: %v.", ctx, err)
+ 		return nil, trace.AccessDenied("access denied: failed to authenticate with auth server")
+ 	}
+-	// remote clusters use special hardcoded URL,
+-	// and use a special dialer
+-	sess.teleportCluster.targetAddr = reversetunnel.LocalKubernetes
+-	transport := f.newTransport(sess.Dial, sess.tlsConfig)
++	transport := f.newTransport(sess.DialWithEndpoints, sess.tlsConfig)
+ 
+ 	sess.forwarder, err = forward.New(
+ 		forward.FlushInterval(100*time.Millisecond),
+@@ -1490,8 +1503,9 @@ outer:
+ func (f *Forwarder) newClusterSessionLocal(ctx authContext) (*clusterSession, error) {
+ 	f.log.Debugf("Handling kubernetes session for %v using local credentials.", ctx)
+ 	sess := &clusterSession{
+-		parent:      f,
+-		authContext: ctx,
++		kubeClusterEndpoints: []endpoint{{addr: ""}}, // Will be set below
++		parent:               f,
++		authContext:          ctx,
+ 	}
+ 	if len(f.creds) == 0 {
+ 		return nil, trace.NotFound("this Teleport process is not configured for direct Kubernetes access; you likely need to 'tsh login' into a leaf cluster or 'tsh kube login' into a different kubernetes cluster")
+@@ -1501,7 +1515,8 @@ func (f *Forwarder) newClusterSessionLocal(ctx authContext) (*clusterSession, er
+ 		return nil, trace.NotFound("kubernetes cluster %q not found", ctx.kubeCluster)
+ 	}
+ 	sess.creds = creds
+-	sess.authContext.teleportCluster.targetAddr = creds.targetAddr
++	sess.kubeClusterEndpoints = []endpoint{{addr: creds.targetAddr}}
++	sess.kubeAddress = creds.targetAddr
+ 	sess.tlsConfig = creds.tlsConfig
+ 
+ 	// When running inside Kubernetes cluster or using auth/exec providers,
+@@ -1543,7 +1558,7 @@ func (f *Forwarder) newClusterSessionDirect(ctx authContext, endpoints []endpoin
+ 		// audit logging. Avoid duplicate logging.
+ 		noAuditEvents: true,
+ 	}
+-	sess.authContext.teleportClusterEndpoints = endpoints
++	sess.kubeClusterEndpoints = endpoints
+ 
+ 	var err error
+ 	sess.tlsConfig, err = f.getOrRequestClientCreds(ctx)
+diff --git a/lib/kube/proxy/forwarder_test.go b/lib/kube/proxy/forwarder_test.go
+index 4bbc6931c..31ee17d81 100644
+--- a/lib/kube/proxy/forwarder_test.go
++++ b/lib/kube/proxy/forwarder_test.go
+@@ -637,7 +637,7 @@ func TestNewClusterSession(t *testing.T) {
+ 
+ 		sess, err := f.newClusterSession(authCtx)
+ 		require.NoError(t, err)
+-		require.Equal(t, f.creds["local"].targetAddr, sess.authContext.teleportCluster.targetAddr)
++		require.Equal(t, f.creds["local"].targetAddr, sess.kubeAddress)
+ 		require.NotNil(t, sess.forwarder)
+ 		// Make sure newClusterSession used f.creds instead of requesting a
+ 		// Teleport client cert.
+@@ -656,7 +656,7 @@ func TestNewClusterSession(t *testing.T) {
+ 
+ 		sess, err := f.newClusterSession(authCtx)
+ 		require.NoError(t, err)
+-		require.Equal(t, reversetunnel.LocalKubernetes, sess.authContext.teleportCluster.targetAddr)
++		require.Equal(t, reversetunnel.LocalKubernetes, sess.kubeAddress)
+ 		require.NotNil(t, sess.forwarder)
+ 		// Make sure newClusterSession obtained a new client cert instead of using
+ 		// f.creds.
+@@ -717,7 +717,7 @@ func TestNewClusterSession(t *testing.T) {
+ 				serverID: fmt.Sprintf("%v.local", reverseTunnelKubeServer.GetName()),
+ 			},
+ 		}
+-		require.Equal(t, expectedEndpoints, sess.authContext.teleportClusterEndpoints)
++		require.Equal(t, expectedEndpoints, sess.kubeClusterEndpoints)
+ 	})
+ }
+ 
+@@ -773,7 +773,7 @@ func TestDialWithEndpoints(t *testing.T) {
+ 		_, err = sess.dialWithEndpoints(ctx, "", "")
+ 		require.NoError(t, err)
+ 
+-		require.Equal(t, publicKubeServer.GetAddr(), sess.authContext.teleportCluster.targetAddr)
++		require.Equal(t, publicKubeServer.GetAddr(), sess.kubeAddress)
+ 		expectServerID := fmt.Sprintf("%v.%v", publicKubeServer.GetName(), authCtx.teleportCluster.name)
+ 		require.Equal(t, expectServerID, sess.authContext.teleportCluster.serverID)
+ 	})
+@@ -806,7 +806,7 @@ func TestDialWithEndpoints(t *testing.T) {
+ 		_, err = sess.dialWithEndpoints(ctx, "", "")
+ 		require.NoError(t, err)
+ 
+-		require.Equal(t, reverseTunnelKubeServer.GetAddr(), sess.authContext.teleportCluster.targetAddr)
++		require.Equal(t, reverseTunnelKubeServer.GetAddr(), sess.kubeAddress)
+ 		expectServerID := fmt.Sprintf("%v.%v", reverseTunnelKubeServer.GetName(), authCtx.teleportCluster.name)
+ 		require.Equal(t, expectServerID, sess.authContext.teleportCluster.serverID)
+ 	})
+@@ -826,7 +826,7 @@ func TestDialWithEndpoints(t *testing.T) {
+ 		require.NoError(t, err)
+ 
+ 		// The endpoint used to dial will be chosen at random. Make sure we hit one of them.
+-		switch sess.teleportCluster.targetAddr {
++		switch sess.kubeAddress {
+ 		case publicKubeServer.GetAddr():
+ 			expectServerID := fmt.Sprintf("%v.%v", publicKubeServer.GetName(), authCtx.teleportCluster.name)
+ 			require.Equal(t, expectServerID, sess.authContext.teleportCluster.serverID)
+@@ -834,7 +834,7 @@ func TestDialWithEndpoints(t *testing.T) {
+ 			expectServerID := fmt.Sprintf("%v.%v", reverseTunnelKubeServer.GetName(), authCtx.teleportCluster.name)
+ 			require.Equal(t, expectServerID, sess.authContext.teleportCluster.serverID)
+ 		default:
+-			t.Fatalf("Unexpected targetAddr: %v", sess.authContext.teleportCluster.targetAddr)
++			t.Fatalf("Unexpected targetAddr: %v", sess.kubeAddress)
+ 		}
+ 	})
+ }

@@ -1,0 +1,73 @@
+diff --git a/qutebrowser/misc/guiprocess.py b/qutebrowser/misc/guiprocess.py
+index 3a6ab156a..51f6dd218 100644
+--- a/qutebrowser/misc/guiprocess.py
++++ b/qutebrowser/misc/guiprocess.py
+@@ -23,6 +23,7 @@ import dataclasses
+ import locale
+ import shlex
+ import shutil
++import signal
+ from typing import Mapping, Sequence, Dict, Optional
+ 
+ from qutebrowser.qt.core import (pyqtSlot, pyqtSignal, QObject, QProcess,
+@@ -106,7 +107,12 @@ class ProcessOutcome:
+         assert self.code is not None
+ 
+         if self.status == QProcess.ExitStatus.CrashExit:
+-            return f"{self.what.capitalize()} crashed."
++            # Process was killed by a signal
++            signal_name = signal.Signals(self.code).name
++            if self.code == signal.SIGTERM:
++                return f"{self.what.capitalize()} terminated with status {self.code} ({signal_name})."
++            else:
++                return f"{self.what.capitalize()} crashed with status {self.code} ({signal_name})."
+         elif self.was_successful():
+             return f"{self.what.capitalize()} exited successfully."
+ 
+@@ -125,13 +131,18 @@ class ProcessOutcome:
+         elif self.status is None:
+             return 'not started'
+         elif self.status == QProcess.ExitStatus.CrashExit:
+-            return 'crashed'
++            # Process was killed by a signal
++            if self.code == signal.SIGTERM:
++                return 'terminated'
++            else:
++                return 'crashed'
+         elif self.was_successful():
+             return 'successful'
+         else:
+             return 'unsuccessful'
+ 
+ 
++
+ class GUIProcess(QObject):
+ 
+     """An external process which shows notifications in the GUI.
+@@ -321,14 +332,24 @@ class GUIProcess(QObject):
+ 
+         if self.outcome.was_successful():
+             if self.verbose:
+-                message.info(str(self.outcome))
++                msg = f"{str(self.outcome)} See :process {self.pid} for details."
++                message.info(msg)
+             self._cleanup_timer.start()
++        elif status == QProcess.ExitStatus.CrashExit and code == signal.SIGTERM:
++            # Process was killed by SIGTERM
++            # Only emit a message if verbose is set
++            if self.verbose:
++                msg = f"{str(self.outcome)} See :process {self.pid} for details."
++                message.info(msg)
++            # No message otherwise - SIGTERM is treated like a successful exit
+         else:
++            # Process failed (non-zero exit code or killed by signal other than SIGTERM)
+             if self.stdout:
+                 log.procs.error("Process stdout:\n" + self.stdout.strip())
+             if self.stderr:
+                 log.procs.error("Process stderr:\n" + self.stderr.strip())
+-            message.error(str(self.outcome) + " See :process for details.")
++            msg = f"{str(self.outcome)} See :process {self.pid} for details."
++            message.error(msg)
+ 
+     @pyqtSlot()
+     def _on_started(self) -> None:

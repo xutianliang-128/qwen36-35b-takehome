@@ -1,0 +1,376 @@
+diff --git a/go.mod b/go.mod
+index 5c5633992..51e1bec89 100644
+--- a/go.mod
++++ b/go.mod
+@@ -3,6 +3,7 @@ module github.com/gravitational/teleport
+ go 1.18
+ 
+ require (
++	github.com/mdlayher/netlink v1.6.0
+ 	cloud.google.com/go/firestore v1.6.1
+ 	cloud.google.com/go/iam v0.3.0
+ 	cloud.google.com/go/storage v1.23.0
+@@ -326,3 +327,4 @@ replace (
+ 	github.com/sirupsen/logrus => github.com/gravitational/logrus v1.4.4-0.20210817004754-047e20245621
+ 	github.com/vulcand/predicate => github.com/gravitational/predicate v1.2.1
+ )
++
+diff --git a/go.sum b/go.sum
+index 29252aca6..625aac574 100644
+--- a/go.sum
++++ b/go.sum
+@@ -1934,3 +1934,5 @@ sigs.k8s.io/yaml v1.2.0/go.mod h1:yfXDCHCao9+ENCvLSE62v9VSji2MKu5jeNfTrofGhJc=
+ sigs.k8s.io/yaml v1.3.0 h1:a2VclLzOGrwOHDiV8EfBGhvjHvP46CtW5j6POvhYGGo=
+ sigs.k8s.io/yaml v1.3.0/go.mod h1:GeOyir5tyXNByN85N/dRIT9es5UQNerPYEKK56eTBm8=
+ sourcegraph.com/sourcegraph/appdash v0.0.0-20190731080439-ebfcffb1b5c0/go.mod h1:hI742Nqp5OhwiqlzhgfbWU4mW4yO10fP+LoT9WOswdU=
++github.com/mdlayher/netlink v1.6.0 h1:QISlzuv6ENySmbAnSfmFv+82m0AL5SlPU0GYiq3/pkI=
++github.com/mdlayher/netlink v1.6.0/go.mod h1:MRj5uprKBEqECM9cjp3TSgr0igdpTwLyZNf5jJ/aaKo=
+diff --git a/lib/auditd/auditd_linux.go b/lib/auditd/auditd_linux.go
+new file mode 100644
+index 000000000..f6e80ed6e
+--- /dev/null
++++ b/lib/auditd/auditd_linux.go
+@@ -0,0 +1,198 @@
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//go:build linux
++// +build linux
++
++package auditd
++
++import (
++	"fmt"
++	"os"
++
++	"github.com/mdlayher/netlink"
++	"github.com/mdlayher/netlink/nlenc"
++)
++
++// netlinkConnector wraps *netlink.Conn to implement NetlinkConnector interface.
++type netlinkConnector struct {
++	conn *netlink.Conn
++}
++
++// Execute sends a netlink message.
++func (n *netlinkConnector) Execute(m netlink.Message) ([]netlink.Message, error) {
++	return n.conn.Execute(m)
++}
++
++// Receive receives netlink messages.
++func (n *netlinkConnector) Receive() ([]netlink.Message, error) {
++	return n.conn.Receive()
++}
++
++// Close closes the netlink connection.
++func (n *netlinkConnector) Close() error {
++	return n.conn.Close()
++}
++
++// Client is a Linux client that queries auditd status and emits a single
++// formatted audit event over netlink.
++type Client struct {
++	conn         NetlinkConnector
++	execName     string
++	hostname     string
++	systemUser   string
++	teleportUser string
++	address      string
++	ttyName      string
++	dial         func(family int, config *netlink.Config) (NetlinkConnector, error)
++}
++
++// NewClient creates and initializes a new Linux auditd client from the given
++// message, applying the message defaults and resolving the executable name
++// and host name; the returned client is not connected yet.
++func NewClient(msg Message) *Client {
++	msg.SetDefaults()
++
++	execName := "teleport"
++	hostname := "localhost"
++	if h, err := os.Hostname(); err == nil {
++		hostname = h
++	}
++
++	return &Client{
++		execName:     execName,
++		hostname:     hostname,
++		systemUser:   msg.SystemUser,
++		teleportUser: msg.TeleportUser,
++		address:      msg.Address,
++		ttyName:      msg.TTYName,
++		dial: func(family int, config *netlink.Config) (NetlinkConnector, error) {
++			conn, err := netlink.Dial(family, config)
++			if err != nil {
++				return nil, err
++			}
++			return &netlinkConnector{conn: conn}, nil
++		},
++	}
++}
++
++// SendMsg checks auditd status and, when enabled, sends one formatted audit
++// event for the given event kind and result; returns the disabled error when
++// auditd is off and an error beginning with "failed to get auditd status: "
++// when the status cannot be read.
++func (c *Client) SendMsg(event EventType, result ResultType) error {
++	// Establish connection if not already done
++	if c.conn == nil {
++		conn, err := c.dial(netlink.HeaderFamilyAudit, nil)
++		if err != nil {
++			return fmt.Errorf("failed to get auditd status: %w", err)
++		}
++		c.conn = conn
++	}
++
++	// Query auditd status
++	statusMsg := netlink.Message{
++		Header: netlink.Header{
++			Type:  netlink.HeaderType(AuditGet),
++			Flags: netlink.Request | netlink.Acknowledge,
++		},
++	}
++
++	if _, err := c.conn.Execute(statusMsg); err != nil {
++		return fmt.Errorf("failed to get auditd status: %w", err)
++	}
++
++	replies, err := c.conn.Receive()
++	if err != nil {
++		return fmt.Errorf("failed to get auditd status: %w", err)
++	}
++
++	if len(replies) == 0 {
++		return fmt.Errorf("failed to get auditd status: no reply received")
++	}
++
++	// Decode status from the first reply
++	if len(replies[0].Data) < 4 {
++		return fmt.Errorf("failed to get auditd status: reply too short")
++	}
++
++	var status auditStatus
++	status.Enabled = nlenc.Uint32Bytes(replies[0].Data[:4])
++
++	// Check if auditd is enabled
++	if status.Enabled == 0 {
++		return ErrAuditdDisabled
++	}
++
++	// Build and send the audit event
++	eventMsg := c.buildEventMessage(event, result)
++	if _, err := c.conn.Execute(eventMsg); err != nil {
++		return fmt.Errorf("failed to send audit event: %w", err)
++	}
++
++	return nil
++}
++
++// Close closes the underlying netlink connection, clears it from the client
++// and resets the cached enabled state so the client can be reused.
++func (c *Client) Close() error {
++	if c.conn != nil {
++		err := c.conn.Close()
++		c.conn = nil
++		return err
++	}
++	return nil
++}
++
++// buildEventMessage creates a netlink message for the audit event.
++func (c *Client) buildEventMessage(event EventType, result ResultType) netlink.Message {
++	op := eventToOperation(event)
++
++	payload := fmt.Sprintf(
++		"op=%s acct=\"%s\" exe=\"%s\" hostname=%s addr=%s terminal=%s",
++		op,
++		c.systemUser,
++		c.execName,
++		c.hostname,
++		c.address,
++		c.ttyName,
++	)
++
++	// Add teleportUser if non-empty
++	if c.teleportUser != "" {
++		payload += fmt.Sprintf(" teleportUser=%s", c.teleportUser)
++	}
++
++	payload += fmt.Sprintf(" res=%s", result.String())
++
++	return netlink.Message{
++		Header: netlink.Header{
++			Type:  netlink.HeaderType(event),
++			Flags: netlink.Request | netlink.Acknowledge,
++		},
++		Data: []byte(payload),
++	}
++}
++
++// eventToOperation maps an EventType to its corresponding operation string.
++func eventToOperation(event EventType) string {
++	switch event {
++	case AuditUserLogin:
++		return "login"
++	case AuditUserEnd:
++		return "session_close"
++	case AuditUserErr:
++		return "invalid_user"
++	default:
++		return UnknownValue
++	}
++}
+diff --git a/lib/auditd/auditd_nonlinux.go b/lib/auditd/auditd_nonlinux.go
+new file mode 100644
+index 000000000..7303f2d30
+--- /dev/null
++++ b/lib/auditd/auditd_nonlinux.go
+@@ -0,0 +1,33 @@
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//go:build !linux
++// +build !linux
++
++package auditd
++
++// SendEvent sends a single auditd event over a fresh connection, reporting no
++// error when the process lacks the privileges to talk to auditd or when auditd
++// is disabled; on builds without the Linux audit subsystem it does nothing and
++// reports no error.
++func SendEvent(event EventType, result ResultType, msg Message) error {
++	// No-op on non-Linux systems
++	return nil
++}
++
++// IsLoginUIDSet reports whether the current process has a login UID assigned,
++// returning false when the process lacks the privileges to talk to auditd,
++// when auditd is disabled or when the value is unset; on builds without the
++// Linux audit subsystem it always returns false.
++func IsLoginUIDSet() bool {
++	return false
++}
+diff --git a/lib/auditd/common.go b/lib/auditd/common.go
+new file mode 100644
+index 000000000..8f81b7abb
+--- /dev/null
++++ b/lib/auditd/common.go
+@@ -0,0 +1,100 @@
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package auditd provides integration with the Linux Audit subsystem.
++// This package is Linux-specific; on other platforms it provides stubs.
++package auditd
++
++import (
++	"errors"
++
++	"github.com/mdlayher/netlink"
++)
++
++// EventType represents an audit event type constant from the Linux kernel.
++type EventType int
++
++const (
++	// AuditGet is the kernel code for AUDIT_GET (1000).
++	AuditGet EventType = 1000
++	// AuditUserEnd is the kernel code for AUDIT_USER_END (1106).
++	AuditUserEnd EventType = 1106
++	// AuditUserErr is the kernel code for AUDIT_USER_ERR (1109).
++	AuditUserErr EventType = 1109
++	// AuditUserLogin is the kernel code for AUDIT_USER_LOGIN (1112).
++	AuditUserLogin EventType = 1112
++)
++
++// ResultType represents the result of an audit event.
++type ResultType int
++
++const (
++	// Success indicates a successful audit event.
++	Success ResultType = iota
++	// Failed indicates a failed audit event.
++	Failed
++)
++
++// String returns the string representation of the ResultType.
++func (r ResultType) String() string {
++	switch r {
++	case Success:
++		return "success"
++	case Failed:
++		return "failed"
++	default:
++		return "unknown"
++	}
++}
++
++// UnknownValue is the placeholder value for unknown fields.
++const UnknownValue = "?"
++
++// ErrAuditdDisabled is returned when auditd is disabled on the system.
++var ErrAuditdDisabled = errors.New("auditd is disabled")
++
++// NetlinkConnector abstracts the netlink connection operations.
++type NetlinkConnector interface {
++	Execute(m netlink.Message) ([]netlink.Message, error)
++	Receive() ([]netlink.Message, error)
++	Close() error
++}
++
++// Message carries the system user, Teleport user, connection address, and TTY
++// name used to compose an auditd event payload.
++type Message struct {
++	SystemUser   string
++	TeleportUser string
++	Address      string
++	TTYName      string
++}
++
++// SetDefaults fills the absent fields of the message with the values OpenSSH
++// uses, leaving the system user and connection address as the unknown-value
++// marker and naming the terminal "teleport" when no TTY name is given.
++func (m *Message) SetDefaults() {
++	if m.SystemUser == "" {
++		m.SystemUser = UnknownValue
++	}
++	if m.Address == "" {
++		m.Address = UnknownValue
++	}
++	if m.TTYName == "" {
++		m.TTYName = "teleport"
++	}
++}
++
++// auditStatus is a fixed-size, binary-serializable struct representing the
++// audit daemon status response.
++type auditStatus struct {
++	Enabled uint32
++}

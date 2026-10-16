@@ -1,0 +1,36 @@
+# Terminal-Bench 2.0 — fixed for ALL evaluated models (base, experts, merged). Frozen before training.
+dataset: terminal-bench@2.0            # Harbor legacy registry, 89 tasks; manifest: terminal_bench_2.0_manifest.json
+harness: harbor==0.24.0
+agent: terminus-2                      # parser=json (default)
+environment: modal                     # Modal sandboxes; images = official per-task docker_image
+runs: 5                                # seeds/attempts 1..5, report mean ± std of task success rate
+
+# Model-card setting (Qwen3.6-35B-A3B README). Official TB2 tasks use 1-8 CPU / 2-16 GB and
+# 3-120 min agent timeouts; these are overridden here, so scores are "this experiment's setting".
+resources:
+  override_cpus: 32
+  override_memory_mb: 49152
+  # --cpus limit --memory limit: Modal gets (small request, 32 CPU / 48GB limit), billed by usage.
+  # Harbor's default `auto` mode reserves the full 32 CPU / 48GB (cpu=(32,32)), billed ~$1.84/sandbox-hour
+  # (measured in the 8-task pilot). Limits are what the task can use; only the reservation changes.
+  cpu_policy: limit
+  memory_policy: limit
+  agent_timeout_sec: 10800             # written into the frozen task.toml files (3h)
+  verifier_timeout: official per task
+
+sampling:
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  max_tokens: 81920                    # 80K per call
+  presence_penalty: 0.0                # model card does not state it for TB; vLLM default
+
+context:
+  max_model_len: 262144                # 256K served context
+  # prompt + max_tokens must fit in 256K, so Terminus-2 summarizes once input nears 256K-80K.
+  terminus_max_input_tokens: 180224
+  enable_summarize: true               # Terminus-2 default; model card does not specify
+  interleaved_thinking: false          # = preserve_thinking off; Terminus-2 default
+
+thinking: enabled (chat template default)
+quantization: none (bf16)

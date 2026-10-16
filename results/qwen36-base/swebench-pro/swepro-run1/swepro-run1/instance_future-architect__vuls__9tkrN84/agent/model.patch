@@ -1,0 +1,525 @@
+diff --git a/scanner/redhatbase.go b/scanner/redhatbase.go
+index 578ca2f..a302d96 100644
+--- a/scanner/redhatbase.go
++++ b/scanner/redhatbase.go
+@@ -543,7 +543,7 @@ func (o *redhatBase) parseInstalledPackages(stdout string) (models.Packages, mod
+ 		// `Kernel` and `kernel-devel` package may be installed multiple versions.
+ 		// From the viewpoint of vulnerability detection,
+ 		// pay attention only to the running kernel
+-		isKernel, running := isRunningKernel(*pack, o.Distro.Family, o.Kernel)
++		isKernel, running := isRunningKernel(*pack, o.Distro.Family, o.Distro.Release, o.Kernel)
+ 		if isKernel {
+ 			if o.Kernel.Release == "" {
+ 				// When the running kernel release is unknown,
+diff --git a/scanner/utils.go b/scanner/utils.go
+index 4332828..31b3b79 100644
+--- a/scanner/utils.go
++++ b/scanner/utils.go
+@@ -4,6 +4,7 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -14,11 +15,54 @@ import (
+ 	"golang.org/x/xerrors"
+ )
+ 
+-func isRunningKernel(pack models.Package, family string, kernel models.Kernel) (isKernel, running bool) {
++// isKernelPackage returns true if the package is a kernel package
++func isKernelPackage(packName string) bool {
++	switch packName {
++	case "kernel", "kernel-devel", "kernel-core", "kernel-modules", "kernel-uek":
++		return true
++	}
++
++	// Check for kernel-debug*, kernel-rt*, kernel-modules*, kernel-debug-modules*, kernel-debug-modules-extra
++	if strings.HasPrefix(packName, "kernel-debug") {
++		return true
++	}
++	if strings.HasPrefix(packName, "kernel-rt") {
++		return true
++	}
++	if strings.HasPrefix(packName, "kernel-modules") {
++		return true
++	}
++
++	return false
++}
++
++// isKernelAccessory returns true if the package is a kernel accessory package
++// that should always be included regardless of the running kernel
++func isKernelAccessory(packName string) bool {
++	switch packName {
++	case "kernel-tools", "kernel-tools-libs", "kernel-srpm-macros", "perf", "python-perf":
++		return true
++	}
++	return false
++}
++
++// isDebugKernel returns true if the package name indicates a debug kernel variant
++func isDebugKernel(packName string) bool {
++	return strings.HasPrefix(packName, "kernel-debug")
++}
++
++// isDebugRunningKernel returns true if the running kernel release contains "+debug"
++func isDebugRunningKernel(kernelRelease string) bool {
++	return strings.HasSuffix(kernelRelease, "+debug")
++}
++
++// isRunningKernel determines if a package is a kernel package and if it matches the running kernel.
++// The release string parameter is used to determine the correct kernel release string format.
++func isRunningKernel(pack models.Package, family string, release string, kernel models.Kernel) (isKernelPkg, running bool) {
+ 	switch family {
+ 	case constant.OpenSUSE, constant.OpenSUSELeap, constant.SUSEEnterpriseServer, constant.SUSEEnterpriseDesktop:
+ 		if pack.Name == "kernel-default" {
+-			// Remove the last period and later because uname don't show that.
++			// Remove the last period and later because uname doesn't show that.
+ 			ss := strings.Split(pack.Release, ".")
+ 			rel := strings.Join(ss[0:len(ss)-1], ".")
+ 			ver := fmt.Sprintf("%s-%s-default", pack.Version, rel)
+@@ -27,12 +71,46 @@ func isRunningKernel(pack models.Package, family string, kernel models.Kernel) (
+ 		return false, false
+ 
+ 	case constant.RedHat, constant.Oracle, constant.CentOS, constant.Alma, constant.Rocky, constant.Amazon, constant.Fedora:
+-		switch pack.Name {
+-		case "kernel", "kernel-devel", "kernel-core", "kernel-modules", "kernel-uek":
+-			ver := fmt.Sprintf("%s-%s.%s", pack.Version, pack.Release, pack.Arch)
+-			return true, kernel.Release == ver
++		if !isKernelPackage(pack.Name) {
++			return false, false
+ 		}
+-		return false, false
++
++		// Check if the running kernel is a debug variant
++		runningKernelDebug := isDebugRunningKernel(kernel.Release)
++
++		// Check if the package is a debug variant
++		packDebug := isDebugKernel(pack.Name)
++
++		// Debug running kernel must match only debug-named kernel packages
++		// Non-debug running kernel must match only non-debug kernel packages
++		if runningKernelDebug != packDebug {
++			return true, false
++		}
++
++		// Determine the major version from the release string
++		// This is used to determine the release format for modern vs legacy systems
++		_, err := getDistroMajorVersion(release)
++		if err != nil {
++			// If we can't determine the major version, use a heuristic based on the pack.Version
++			_, err = getMajorVersionFromKernelVersion(pack.Version)
++			if err != nil {
++				// If we still can't determine the version, we'll use modern format as default
++			}
++		}
++
++		// On modern Red Hat-family releases (RHEL 6+, Alma, Rocky, Amazon, Fedora >= 9),
++		// a package is running only when the kernel release equals <Version>-<Release>.<Arch>
++		// For debug-named packages, it should be <Version>-<Release>.<Arch>+debug
++		// On legacy releases (RHEL/CentOS/Oracle major below 6, Fedora major below 9),
++		// it must equal <Version>-<Release> or <Version>-<Release>debug
++
++		// All Red Hat-family distributions (including Amazon Linux) use architecture-suffixed format
++		// when there is a known kernel release
++		expectedRelease := fmt.Sprintf("%s-%s.%s", pack.Version, pack.Release, pack.Arch)
++		if packDebug {
++			expectedRelease = fmt.Sprintf("%s-%s.%s+debug", pack.Version, pack.Release, pack.Arch)
++		}
++		return true, kernel.Release == expectedRelease
+ 
+ 	default:
+ 		logging.Log.Warnf("Reboot required is not implemented yet: %s, %v", family, kernel)
+@@ -40,6 +118,45 @@ func isRunningKernel(pack models.Package, family string, kernel models.Kernel) (
+ 	return false, false
+ }
+ 
++// getDistroMajorVersion extracts the major version from the distribution release string
++func getDistroMajorVersion(release string) (int, error) {
++	if release == "" {
++		return 0, fmt.Errorf("empty release string")
++	}
++
++	// Extract the first numeric part (the major version)
++	parts := strings.Fields(release)
++	if len(parts) > 0 {
++		// Try to parse the first field as a number
++		if major, err := strconv.Atoi(parts[0]); err == nil {
++			return major, nil
++		}
++	}
++
++	// Try to extract major version from release patterns like "8.9" or "9.0"
++	re := strings.Split(release, ".")
++	if len(re) > 0 {
++		if major, err := strconv.Atoi(re[0]); err == nil {
++			return major, nil
++		}
++	}
++
++	return 0, fmt.Errorf("could not extract major version from release: %s", release)
++}
++
++// getMajorVersionFromKernelVersion extracts a major version from kernel version string
++// as a fallback when the distro release is not available
++func getMajorVersionFromKernelVersion(version string) (int, error) {
++	// Extract the first number from the version
++	parts := strings.Split(version, ".")
++	if len(parts) > 0 {
++		if major, err := strconv.Atoi(parts[0]); err == nil {
++			return major, nil
++		}
++	}
++	return 0, fmt.Errorf("could not extract major version from kernel version: %s", version)
++}
++
+ // EnsureResultDir ensures the directory for scan results
+ func EnsureResultDir(resultsDir string, scannedAt time.Time) (currentDir string, err error) {
+ 	jsonDirName := scannedAt.Format("2006-01-02T15-04-05-0700")
+diff --git a/scanner/utils_test.go b/scanner/utils_test.go
+index 454106f..03cacd3 100644
+--- a/scanner/utils_test.go
++++ b/scanner/utils_test.go
+@@ -20,6 +20,7 @@ func TestIsRunningKernelSUSE(t *testing.T) {
+ 	var tests = []struct {
+ 		pack     models.Package
+ 		family   string
++		release  string
+ 		kernel   models.Kernel
+ 		expected bool
+ 	}{
+@@ -31,6 +32,7 @@ func TestIsRunningKernelSUSE(t *testing.T) {
+ 				Arch:    "x86_64",
+ 			},
+ 			family:   constant.SUSEEnterpriseServer,
++			release:  "15 SP5",
+ 			kernel:   kernel,
+ 			expected: true,
+ 		},
+@@ -42,13 +44,14 @@ func TestIsRunningKernelSUSE(t *testing.T) {
+ 				Arch:    "x86_64",
+ 			},
+ 			family:   constant.SUSEEnterpriseServer,
++			release:  "15 SP5",
+ 			kernel:   kernel,
+ 			expected: false,
+ 		},
+ 	}
+ 
+ 	for i, tt := range tests {
+-		_, actual := isRunningKernel(tt.pack, tt.family, tt.kernel)
++		_, actual := isRunningKernel(tt.pack, tt.family, tt.release, tt.kernel)
+ 		if tt.expected != actual {
+ 			t.Errorf("[%d] expected %t, actual %t", i, tt.expected, actual)
+ 		}
+@@ -59,6 +62,7 @@ func TestIsRunningKernelRedHatLikeLinux(t *testing.T) {
+ 	r := newAmazon(config.ServerInfo{})
+ 	r.Distro = config.Distro{Family: constant.Amazon}
+ 
++	// Amazon Linux 1 - uses architecture-suffixed format (same as other RHEL-family)
+ 	kernel := models.Kernel{
+ 		Release: "4.9.43-17.38.amzn1.x86_64",
+ 		Version: "",
+@@ -67,6 +71,7 @@ func TestIsRunningKernelRedHatLikeLinux(t *testing.T) {
+ 	var tests = []struct {
+ 		pack     models.Package
+ 		family   string
++		release  string
+ 		kernel   models.Kernel
+ 		expected bool
+ 	}{
+@@ -78,6 +83,7 @@ func TestIsRunningKernelRedHatLikeLinux(t *testing.T) {
+ 				Arch:    "x86_64",
+ 			},
+ 			family:   constant.Amazon,
++			release:  "1",
+ 			kernel:   kernel,
+ 			expected: true,
+ 		},
+@@ -89,15 +95,283 @@ func TestIsRunningKernelRedHatLikeLinux(t *testing.T) {
+ 				Arch:    "x86_64",
+ 			},
+ 			family:   constant.Amazon,
++			release:  "1",
+ 			kernel:   kernel,
+ 			expected: false,
+ 		},
++		// Test Amazon Linux 2 with modern format
++		{
++			pack: models.Package{
++				Name:    "kernel",
++				Version: "4.14.123",
++				Release: "114.104.amzn2",
++				Arch:    "x86_64",
++			},
++			family:   constant.Amazon,
++			release:  "2 (Karoo)",
++			kernel: models.Kernel{
++				Release: "4.14.123-114.104.amzn2.x86_64",
++				Version: "",
++			},
++			expected: true,
++		},
++		{
++			pack: models.Package{
++				Name:    "kernel",
++				Version: "4.14.123",
++				Release: "113.103.amzn2",
++				Arch:    "x86_64",
++			},
++			family:   constant.Amazon,
++			release:  "2 (Karoo)",
++			kernel: models.Kernel{
++				Release: "4.14.123-114.104.amzn2.x86_64",
++				Version: "",
++			},
++			expected: false,
++		},
+ 	}
+ 
+ 	for i, tt := range tests {
+-		_, actual := isRunningKernel(tt.pack, tt.family, tt.kernel)
++		_, actual := isRunningKernel(tt.pack, tt.family, tt.release, tt.kernel)
+ 		if tt.expected != actual {
+ 			t.Errorf("[%d] expected %t, actual %t", i, tt.expected, actual)
+ 		}
+ 	}
+ }
++
++func TestIsRunningKernelDebugVariants(t *testing.T) {
++	// Test RHEL 9 with debug kernel
++	tests := []struct {
++		name     string
++		pack     models.Package
++		family   string
++		release  string
++		kernel   models.Kernel
++		expected bool // running
++	}{
++		{
++			name: "debug kernel matches debug package",
++			pack: models.Package{
++				Name:    "kernel-debug",
++				Version: "5.14.0",
++				Release: "427.13.1.el9_4",
++				Arch:    "x86_64",
++			},
++			family:  constant.Alma,
++			release: "9.4",
++			kernel: models.Kernel{
++				Release: "5.14.0-427.13.1.el9_4.x86_64+debug",
++				Version: "",
++			},
++			expected: true,
++		},
++		{
++			name: "debug kernel does not match non-debug package",
++			pack: models.Package{
++				Name:    "kernel",
++				Version: "5.14.0",
++				Release: "427.13.1.el9_4",
++				Arch:    "x86_64",
++			},
++			family:  constant.Alma,
++			release: "9.4",
++			kernel: models.Kernel{
++				Release: "5.14.0-427.13.1.el9_4.x86_64+debug",
++				Version: "",
++			},
++			expected: false,
++		},
++		{
++			name: "non-debug kernel does not match debug package",
++			pack: models.Package{
++				Name:    "kernel-debug",
++				Version: "5.14.0",
++				Release: "427.13.1.el9_4",
++				Arch:    "x86_64",
++			},
++			family:  constant.Rocky,
++			release: "9.4",
++			kernel: models.Kernel{
++				Release: "5.14.0-427.13.1.el9_4.x86_64",
++				Version: "",
++			},
++			expected: false,
++		},
++		{
++			name: "non-debug kernel matches non-debug package",
++			pack: models.Package{
++				Name:    "kernel",
++				Version: "5.14.0",
++				Release: "427.13.1.el9_4",
++				Arch:    "x86_64",
++			},
++			family:  constant.Rocky,
++			release: "9.4",
++			kernel: models.Kernel{
++				Release: "5.14.0-427.13.1.el9_4.x86_64",
++				Version: "",
++			},
++			expected: true,
++		},
++		{
++			name: "debug package matches running kernel with wrong version",
++			pack: models.Package{
++				Name:    "kernel-debug",
++				Version: "5.14.0",
++				Release: "427.18.1.el9_4",
++				Arch:    "x86_64",
++			},
++			family:  constant.Alma,
++			release: "9.4",
++			kernel: models.Kernel{
++				Release: "5.14.0-427.13.1.el9_4.x86_64+debug",
++				Version: "",
++			},
++			expected: false,
++		},
++		// kernel-modules-extra tests
++		{
++			name: "kernel-modules-extra matches running kernel",
++			pack: models.Package{
++				Name:    "kernel-modules-extra",
++				Version: "5.14.0",
++				Release: "427.13.1.el9_4",
++				Arch:    "x86_64",
++			},
++			family:  constant.Fedora,
++			release: "38",
++			kernel: models.Kernel{
++				Release: "5.14.0-427.13.1.el9_4.x86_64",
++				Version: "",
++			},
++			expected: true,
++		},
++		// kernel-debug-modules-extra tests
++		{
++			name: "kernel-debug-modules-extra matches running debug kernel",
++			pack: models.Package{
++				Name:    "kernel-debug-modules-extra",
++				Version: "5.14.0",
++				Release: "427.13.1.el9_4",
++				Arch:    "x86_64",
++			},
++			family:  constant.Alma,
++			release: "9.4",
++			kernel: models.Kernel{
++				Release: "5.14.0-427.13.1.el9_4.x86_64+debug",
++				Version: "",
++			},
++			expected: true,
++		},
++		// Legacy RHEL 6 format tests (uses architecture-suffixed format)
++		{
++			name: "RHEL 6 kernel matches",
++			pack: models.Package{
++				Name:    "kernel",
++				Version: "2.6.32",
++				Release: "696.20.3.el6",
++				Arch:    "x86_64",
++			},
++			family:  constant.CentOS,
++			release: "6.10",
++			kernel: models.Kernel{
++				Release: "2.6.32-696.20.3.el6.x86_64",
++				Version: "",
++			},
++			expected: true,
++		},
++		{
++			name: "RHEL 6 kernel does not match",
++			pack: models.Package{
++				Name:    "kernel",
++				Version: "2.6.32",
++				Release: "696.20.1.el6",
++				Arch:    "x86_64",
++			},
++			family:  constant.CentOS,
++			release: "6.10",
++			kernel: models.Kernel{
++				Release: "2.6.32-696.20.3.el6.x86_64",
++				Version: "",
++			},
++			expected: false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			_, actual := isRunningKernel(tt.pack, tt.family, tt.release, tt.kernel)
++			if tt.expected != actual {
++				t.Errorf("expected %t, actual %t", tt.expected, actual)
++			}
++		})
++	}
++}
++
++func TestIsKernelPackage(t *testing.T) {
++	tests := []struct {
++		name     string
++		packName string
++		expected bool
++	}{
++		// Standard kernel packages
++		{name: "kernel", packName: "kernel", expected: true},
++		{name: "kernel-devel", packName: "kernel-devel", expected: true},
++		{name: "kernel-core", packName: "kernel-core", expected: true},
++		{name: "kernel-modules", packName: "kernel-modules", expected: true},
++		{name: "kernel-uek", packName: "kernel-uek", expected: true},
++		// Debug variants
++		{name: "kernel-debug", packName: "kernel-debug", expected: true},
++		{name: "kernel-debug-core", packName: "kernel-debug-core", expected: true},
++		{name: "kernel-debug-modules", packName: "kernel-debug-modules", expected: true},
++		{name: "kernel-debug-modules-extra", packName: "kernel-debug-modules-extra", expected: true},
++		// RT variants
++		{name: "kernel-rt", packName: "kernel-rt", expected: true},
++		{name: "kernel-rt-core", packName: "kernel-rt-core", expected: true},
++		// Non-kernel packages
++		{name: "kernel-tools", packName: "kernel-tools", expected: false},
++		{name: "kernel-tools-libs", packName: "kernel-tools-libs", expected: false},
++		{name: "kernel-srpm-macros", packName: "kernel-srpm-macros", expected: false},
++		{name: "perf", packName: "perf", expected: false},
++		{name: "python-perf", packName: "python-perf", expected: false},
++		{name: "kernel-livepatch", packName: "kernel-livepatch", expected: false},
++		{name: "kernel-livepatch-modules", packName: "kernel-livepatch-modules", expected: false},
++		{name: "openssl", packName: "openssl", expected: false},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			actual := isKernelPackage(tt.packName)
++			if tt.expected != actual {
++				t.Errorf("isKernelPackage(%q) = %t, want %t", tt.packName, actual, tt.expected)
++			}
++		})
++	}
++}
++
++func TestIsKernelAccessory(t *testing.T) {
++	tests := []struct {
++		name     string
++		packName string
++		expected bool
++	}{
++		{name: "kernel-tools", packName: "kernel-tools", expected: true},
++		{name: "kernel-tools-libs", packName: "kernel-tools-libs", expected: true},
++		{name: "kernel-srpm-macros", packName: "kernel-srpm-macros", expected: true},
++		{name: "perf", packName: "perf", expected: true},
++		{name: "python-perf", packName: "python-perf", expected: true},
++		{name: "kernel", packName: "kernel", expected: false},
++		{name: "kernel-debug", packName: "kernel-debug", expected: false},
++		{name: "openssl", packName: "openssl", expected: false},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			actual := isKernelAccessory(tt.packName)
++			if tt.expected != actual {
++				t.Errorf("isKernelAccessory(%q) = %t, want %t", tt.packName, actual, tt.expected)
++			}
++		})
++	}
++}

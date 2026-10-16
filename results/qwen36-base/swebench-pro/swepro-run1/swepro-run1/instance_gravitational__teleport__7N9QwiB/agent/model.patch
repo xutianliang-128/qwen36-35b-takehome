@@ -1,0 +1,526 @@
+diff --git a/lib/ai/chat.go b/lib/ai/chat.go
+index dd2691f91..9f914119c 100644
+--- a/lib/ai/chat.go
++++ b/lib/ai/chat.go
+@@ -50,20 +50,20 @@ func (chat *Chat) GetMessages() []openai.ChatCompletionMessage {
+ }
+ 
+ // Complete completes the conversation with a message from the assistant based on the current context and user input.
+-// On success, it returns the message.
++// On success, it returns the message, a token count, and any error that occurred.
+ // Returned types:
+ // - message: one of the message types below
++// - tokenCount: a non-nil *TokenCount reflecting the prompt and completion usage
+ // - error: an error if one occurred
+ // Message types:
+ // - CompletionCommand: a command from the assistant
+-// - Message: a text message from the assistant
+-func (chat *Chat) Complete(ctx context.Context, userInput string, progressUpdates func(*model.AgentAction)) (any, error) {
++// - StreamingMessage: a text message from the assistant
++func (chat *Chat) Complete(ctx context.Context, userInput string, progressUpdates func(*model.AgentAction)) (any, *model.TokenCount, error) {
+ 	// if the chat is empty, return the initial response we predefine instead of querying GPT-4
+ 	if len(chat.messages) == 1 {
+ 		return &model.Message{
+-			Content:    model.InitialAIResponse,
+-			TokensUsed: &model.TokensUsed{},
+-		}, nil
++			Content: model.InitialAIResponse,
++		}, model.NewTokenCount(), nil
+ 	}
+ 
+ 	userMessage := openai.ChatCompletionMessage{
+@@ -71,12 +71,12 @@ func (chat *Chat) Complete(ctx context.Context, userInput string, progressUpdate
+ 		Content: userInput,
+ 	}
+ 
+-	response, err := chat.agent.PlanAndExecute(ctx, chat.client.svc, chat.messages, userMessage, progressUpdates)
++	response, tokenCount, err := chat.agent.PlanAndExecute(ctx, chat.client.svc, chat.messages, userMessage, progressUpdates)
+ 	if err != nil {
+-		return nil, trace.Wrap(err)
++		return nil, nil, trace.Wrap(err)
+ 	}
+ 
+-	return response, nil
++	return response, tokenCount, nil
+ }
+ 
+ // Clear clears the conversation.
+diff --git a/lib/ai/chat_test.go b/lib/ai/chat_test.go
+index a016574d7..ee00a1680 100644
+--- a/lib/ai/chat_test.go
++++ b/lib/ai/chat_test.go
+@@ -51,7 +51,7 @@ func TestChat_PromptTokens(t *testing.T) {
+ 					Content: "Hello",
+ 				},
+ 			},
+-			want: 697,
++			want: 721,
+ 		},
+ 		{
+ 			name: "system and user messages",
+@@ -65,7 +65,7 @@ func TestChat_PromptTokens(t *testing.T) {
+ 					Content: "Hi LLM.",
+ 				},
+ 			},
+-			want: 705,
++			want: 729,
+ 		},
+ 		{
+ 			name: "tokenize our prompt",
+@@ -79,7 +79,7 @@ func TestChat_PromptTokens(t *testing.T) {
+ 					Content: "Show me free disk space on localhost node.",
+ 				},
+ 			},
+-			want: 908,
++			want: 932,
+ 		},
+ 	}
+ 
+@@ -115,12 +115,12 @@ func TestChat_PromptTokens(t *testing.T) {
+ 			}
+ 
+ 			ctx := context.Background()
+-			message, err := chat.Complete(ctx, "", func(aa *model.AgentAction) {})
++			_, tokenCount, err := chat.Complete(ctx, "", func(aa *model.AgentAction) {})
+ 			require.NoError(t, err)
+-			msg, ok := message.(interface{ UsedTokens() *model.TokensUsed })
+-			require.True(t, ok)
++			require.NotNil(t, tokenCount)
+ 
+-			usedTokens := msg.UsedTokens().Completion + msg.UsedTokens().Prompt
++			promptTokens, completionTokens := tokenCount.CountAll()
++			usedTokens := promptTokens + completionTokens
+ 			require.Equal(t, tt.want, usedTokens)
+ 		})
+ 	}
+@@ -153,14 +153,15 @@ func TestChat_Complete(t *testing.T) {
+ 	chat := client.NewChat(nil, "Bob")
+ 
+ 	ctx := context.Background()
+-	_, err := chat.Complete(ctx, "Hello", func(aa *model.AgentAction) {})
++	_, _, err := chat.Complete(ctx, "Hello", func(aa *model.AgentAction) {})
+ 	require.NoError(t, err)
+ 
+ 	chat.Insert(openai.ChatMessageRoleUser, "Show me free disk space on localhost node.")
+ 
+ 	t.Run("text completion", func(t *testing.T) {
+-		msg, err := chat.Complete(ctx, "Show me free disk space", func(aa *model.AgentAction) {})
++		msg, tokenCount, err := chat.Complete(ctx, "Show me free disk space", func(aa *model.AgentAction) {})
+ 		require.NoError(t, err)
++		require.NotNil(t, tokenCount)
+ 
+ 		require.IsType(t, &model.StreamingMessage{}, msg)
+ 		streamingMessage := msg.(*model.StreamingMessage)
+@@ -171,8 +172,9 @@ func TestChat_Complete(t *testing.T) {
+ 	})
+ 
+ 	t.Run("command completion", func(t *testing.T) {
+-		msg, err := chat.Complete(ctx, "localhost", func(aa *model.AgentAction) {})
++		msg, tokenCount, err := chat.Complete(ctx, "localhost", func(aa *model.AgentAction) {})
+ 		require.NoError(t, err)
++		require.NotNil(t, tokenCount)
+ 
+ 		require.IsType(t, &model.CompletionCommand{}, msg)
+ 		command := msg.(*model.CompletionCommand)
+diff --git a/lib/ai/model/agent.go b/lib/ai/model/agent.go
+index ba54b2791..b2576e498 100644
+--- a/lib/ai/model/agent.go
++++ b/lib/ai/model/agent.go
+@@ -92,24 +92,24 @@ type executionState struct {
+ 	humanMessage      openai.ChatCompletionMessage
+ 	intermediateSteps []AgentAction
+ 	observations      []string
+-	tokensUsed        *TokensUsed
++	tokenCount        *TokenCount
+ }
+ 
+ // PlanAndExecute runs the agent with a given input until it arrives at a text answer it is satisfied
+ // with or until it times out.
+-func (a *Agent) PlanAndExecute(ctx context.Context, llm *openai.Client, chatHistory []openai.ChatCompletionMessage, humanMessage openai.ChatCompletionMessage, progressUpdates func(*AgentAction)) (any, error) {
++func (a *Agent) PlanAndExecute(ctx context.Context, llm *openai.Client, chatHistory []openai.ChatCompletionMessage, humanMessage openai.ChatCompletionMessage, progressUpdates func(*AgentAction)) (any, *TokenCount, error) {
+ 	log.Trace("entering agent think loop")
+ 	iterations := 0
+ 	start := time.Now()
+ 	tookTooLong := func() bool { return iterations > maxIterations || time.Since(start) > maxElapsedTime }
+-	tokensUsed := newTokensUsed_Cl100kBase()
++	tokenCount := NewTokenCount()
+ 	state := &executionState{
+ 		llm:               llm,
+ 		chatHistory:       chatHistory,
+ 		humanMessage:      humanMessage,
+ 		intermediateSteps: make([]AgentAction, 0),
+ 		observations:      make([]string, 0),
+-		tokensUsed:        tokensUsed,
++		tokenCount:        tokenCount,
+ 	}
+ 
+ 	for {
+@@ -118,24 +118,24 @@ func (a *Agent) PlanAndExecute(ctx context.Context, llm *openai.Client, chatHist
+ 		// This is intentionally not context-based, as we want to finish the current step before exiting
+ 		// and the concern is not that we're stuck but that we're taking too long over multiple iterations.
+ 		if tookTooLong() {
+-			return nil, trace.Errorf("timeout: agent took too long to finish")
++			return nil, nil, trace.Errorf("timeout: agent took too long to finish")
+ 		}
+ 
+ 		output, err := a.takeNextStep(ctx, state, progressUpdates)
+ 		if err != nil {
+-			return nil, trace.Wrap(err)
++			return nil, nil, trace.Wrap(err)
+ 		}
+ 
+ 		if output.finish != nil {
+ 			log.Tracef("agent finished with output: %#v", output.finish.output)
+-			item, ok := output.finish.output.(interface{ SetUsed(data *TokensUsed) })
++			item, ok := output.finish.output.(interface{ SetUsed(data *TokenCount) })
+ 			if !ok {
+-				return nil, trace.Errorf("invalid output type %T", output.finish.output)
++				return nil, nil, trace.Errorf("invalid output type %T", output.finish.output)
+ 			}
+ 
+-			item.SetUsed(tokensUsed)
++			item.SetUsed(tokenCount)
+ 
+-			return item, nil
++			return item, tokenCount, nil
+ 		}
+ 
+ 		if output.action != nil {
+@@ -198,7 +198,6 @@ func (a *Agent) takeNextStep(ctx context.Context, state *executionState, progres
+ 	}
+ 
+ 	if tool == nil {
+-		log.Tracef("agent picked an unknown tool %v", action.Action)
+ 		action := &AgentAction{
+ 			Action: actionException,
+ 			Input:  observationPrefix + "Unknown tool",
+@@ -221,10 +220,9 @@ func (a *Agent) takeNextStep(ctx context.Context, state *executionState, progres
+ 		}
+ 
+ 		completion := &CompletionCommand{
+-			TokensUsed: newTokensUsed_Cl100kBase(),
+-			Command:    input.Command,
+-			Nodes:      input.Nodes,
+-			Labels:     input.Labels,
++			Command: input.Command,
++			Nodes:   input.Nodes,
++			Labels:  input.Labels,
+ 		}
+ 
+ 		log.Tracef("agent decided on command execution, let's translate to an agentFinish")
+@@ -254,8 +252,18 @@ func (a *Agent) plan(ctx context.Context, state *executionState) (*AgentAction,
+ 		return nil, nil, trace.Wrap(err)
+ 	}
+ 
++	// Create a prompt counter for the full message list sent in this call.
++	promptCounter, err := NewPromptTokenCounter(prompt)
++	if err != nil {
++		return nil, nil, fmt.Errorf("failed to create prompt counter: %w", err)
++	}
++	state.tokenCount.AddPromptCounter(promptCounter)
++
+ 	deltas := make(chan string)
++	var asyncCounter *AsynchronousTokenCounter
+ 	completion := strings.Builder{}
++	var counterInitialized bool
++
+ 	go func() {
+ 		defer close(deltas)
+ 
+@@ -269,14 +277,38 @@ func (a *Agent) plan(ctx context.Context, state *executionState) (*AgentAction,
+ 			}
+ 
+ 			delta := response.Choices[0].Delta.Content
++			if delta == "" {
++				continue
++			}
++
++			// Initialize the async counter from the first content chunk
++			if !counterInitialized {
++				var initErr error
++				asyncCounter, initErr = NewAsynchronousTokenCounter(delta)
++				if initErr != nil {
++					log.Tracef("agent encountered an error initializing async counter: %v", initErr)
++					return
++				}
++				completion.WriteString(delta)
++				counterInitialized = true
++			} else {
++				// Call Add() exactly once for every subsequent streamed delta
++				if err := asyncCounter.Add(); err != nil {
++					log.Tracef("agent encountered an error adding to async counter: %v", err)
++				}
++				completion.WriteString(delta)
++			}
++
+ 			deltas <- delta
+-			// TODO(jakule): Fix token counting. Uncommenting the line below causes a race condition.
+-			//completion.WriteString(delta)
+ 		}
+ 	}()
+ 
+ 	action, finish, err := parsePlanningOutput(deltas)
+-	state.tokensUsed.AddTokens(prompt, completion.String())
++	if err == nil && asyncCounter != nil {
++		// Add the completion counter
++		completionCount := asyncCounter.TokenCount()
++		state.tokenCount.AddCompletionCounter(&StaticTokenCounter{count: completionCount})
++	}
+ 	return action, finish, trace.Wrap(err)
+ }
+ 
+@@ -373,13 +405,13 @@ func parsePlanningOutput(deltas <-chan string) (*AgentAction, *agentFinish, erro
+ 				}
+ 			}()
+ 
+-			return nil, &agentFinish{output: &StreamingMessage{Parts: parts, TokensUsed: newTokensUsed_Cl100kBase()}}, nil
++			return nil, &agentFinish{output: &StreamingMessage{Parts: parts}}, nil
+ 		}
+ 	}
+ 
+ 	log.Tracef("received planning output: \"%v\"", text)
+ 	if outputString, found := strings.CutPrefix(text, finalResponseHeader); found {
+-		return nil, &agentFinish{output: &Message{Content: outputString, TokensUsed: newTokensUsed_Cl100kBase()}}, nil
++		return nil, &agentFinish{output: &Message{Content: outputString}}, nil
+ 	}
+ 
+ 	response, err := parseJSONFromModel[PlanOutput](text)
+diff --git a/lib/ai/model/messages.go b/lib/ai/model/messages.go
+index 0c087740e..b1f908d0e 100644
+--- a/lib/ai/model/messages.go
++++ b/lib/ai/model/messages.go
+@@ -37,16 +37,38 @@ const (
+ 
+ // Message represents a new message within a live conversation.
+ type Message struct {
+-	*TokensUsed
++	*TokenCount
+ 	Content string
+ }
+ 
++// SetUsed sets the TokenCount instance to the given data.
++func (m *Message) SetUsed(data *TokenCount) {
++	m.TokenCount = data
++}
++
++// UsedTokens returns the token count used during a single invocation of the agent.
++// This method creates a convenient way to get TokenCount from the embedded struct.
++func (m *Message) UsedTokens() *TokenCount {
++	return m.TokenCount
++}
++
+ // StreamingMessage represents a new message that is being streamed from the LLM.
+ type StreamingMessage struct {
+-	*TokensUsed
++	*TokenCount
+ 	Parts <-chan string
+ }
+ 
++// SetUsed sets the TokenCount instance to the given data.
++func (m *StreamingMessage) SetUsed(data *TokenCount) {
++	m.TokenCount = data
++}
++
++// UsedTokens returns the token count used during a single invocation of the agent.
++// This method creates a convenient way to get TokenCount from the embedded struct.
++func (m *StreamingMessage) UsedTokens() *TokenCount {
++	return m.TokenCount
++}
++
+ // Label represents a label returned by OpenAI's completion API.
+ type Label struct {
+ 	Key   string `json:"key"`
+@@ -55,13 +77,25 @@ type Label struct {
+ 
+ // CompletionCommand represents a command returned by OpenAI's completion API.
+ type CompletionCommand struct {
+-	*TokensUsed
++	*TokenCount
+ 	Command string   `json:"command,omitempty"`
+ 	Nodes   []string `json:"nodes,omitempty"`
+ 	Labels  []Label  `json:"labels,omitempty"`
+ }
+ 
++// SetUsed sets the TokenCount instance to the given data.
++func (c *CompletionCommand) SetUsed(data *TokenCount) {
++	c.TokenCount = data
++}
++
++// UsedTokens returns the token count used during a single invocation of the agent.
++// This method creates a convenient way to get TokenCount from the embedded struct.
++func (c *CompletionCommand) UsedTokens() *TokenCount {
++	return c.TokenCount
++}
++
+ // TokensUsed is used to track the number of tokens used during a single invocation of the agent.
++// This type is kept for backward compatibility. The primary token tracking now uses TokenCount.
+ type TokensUsed struct {
+ 	tokenizer tokenizer.Codec
+ 
+diff --git a/lib/ai/model/tokencount.go b/lib/ai/model/tokencount.go
+new file mode 100644
+index 000000000..f7e660d3d
+--- /dev/null
++++ b/lib/ai/model/tokencount.go
+@@ -0,0 +1,161 @@
++/*
++Copyright 2023 Gravitational, Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package model
++
++import (
++	"fmt"
++
++	"github.com/sashabaranov/go-openai"
++	"github.com/tiktoken-go/tokenizer/codec"
++)
++
++// defaultTokenizer is the package-level tokenizer used for counting tokens.
++// It produces Cl100kBase-equivalent counts, as used by GPT-3 and GPT-4.
++var defaultTokenizer = codec.NewCl100kBase()
++
++// TokenCounter is an interface for counting tokens.
++type TokenCounter interface {
++	TokenCount() int
++}
++
++// TokenCount stores collections of token counters for prompt and completion
++// tokens, allowing token usage from multiple AI model requests to be
++// aggregated and computed separately.
++type TokenCount struct {
++	promptCounters     TokenCounters
++	completionCounters TokenCounters
++}
++
++// TokenCounters is a slice of token counters that can calculate a total count.
++type TokenCounters []TokenCounter
++
++// NewTokenCount creates and initializes a new TokenCount instance with empty
++// collections for prompt and completion token counters.
++func NewTokenCount() *TokenCount {
++	return &TokenCount{
++		promptCounters:     make(TokenCounters, 0),
++		completionCounters: make(TokenCounters, 0),
++	}
++}
++
++// AddPromptCounter adds a prompt token counter to the collection of prompt
++// token counters if the provided counter is not nil.
++func (tc *TokenCount) AddPromptCounter(counter TokenCounter) {
++	if counter != nil {
++		tc.promptCounters = append(tc.promptCounters, counter)
++	}
++}
++
++// AddCompletionCounter adds a completion token counter to the collection of
++// completion token counters if the provided counter is not nil.
++func (tc *TokenCount) AddCompletionCounter(counter TokenCounter) {
++	if counter != nil {
++		tc.completionCounters = append(tc.completionCounters, counter)
++	}
++}
++
++// CountAll computes the total number of prompt and completion tokens by
++// aggregating the counts from all registered prompt and completion token
++// counters. It returns (promptTokens, completionTokens).
++func (tc *TokenCount) CountAll() (int, int) {
++	promptTokens := tc.promptCounters.CountAll()
++	completionTokens := tc.completionCounters.CountAll()
++	return promptTokens, completionTokens
++}
++
++// CountAll calculates the total number of tokens by summing the token counts
++// returned by all token counters in the collection.
++func (counters TokenCounters) CountAll() int {
++	total := 0
++	for _, counter := range counters {
++		total += counter.TokenCount()
++	}
++	return total
++}
++
++// StaticTokenCounter stores a fixed token count.
++type StaticTokenCounter struct {
++	count int
++}
++
++// TokenCount returns the token count stored in the static token counter.
++func (tc *StaticTokenCounter) TokenCount() int {
++	return tc.count
++}
++
++// NewPromptTokenCounter creates a static token counter by calculating the total
++// number of tokens required for a list of chat completion prompt messages.
++func NewPromptTokenCounter(prompt []openai.ChatCompletionMessage) (*StaticTokenCounter, error) {
++	count := 0
++	for _, message := range prompt {
++		tokens, _, err := defaultTokenizer.Encode(message.Content)
++		if err != nil {
++			return nil, fmt.Errorf("failed to encode message content: %w", err)
++		}
++		count += perMessage + perRole + len(tokens)
++	}
++	return &StaticTokenCounter{count: count}, nil
++}
++
++// NewSynchronousTokenCounter creates a static token counter by calculating
++// the number of tokens used to generate a completed model response.
++func NewSynchronousTokenCounter(completion string) (*StaticTokenCounter, error) {
++	tokens, _, err := defaultTokenizer.Encode(completion)
++	if err != nil {
++		return nil, fmt.Errorf("failed to encode completion: %w", err)
++	}
++	return &StaticTokenCounter{count: perRequest + len(tokens)}, nil
++}
++
++// AsynchronousTokenCounter maintains the token count for streamed AI model
++// completions, allowing tokens to be added incrementally until the counting
++// process is finalized.
++type AsynchronousTokenCounter struct {
++	count    int
++	finished bool
++}
++
++// NewAsynchronousTokenCounter creates and initializes an asynchronous token
++// counter using the initial portion of a streamed model completion, allowing
++// additional tokens to be counted incrementally as more content is received.
++func NewAsynchronousTokenCounter(completionStart string) (*AsynchronousTokenCounter, error) {
++	tokens, _, err := defaultTokenizer.Encode(completionStart)
++	if err != nil {
++		return nil, fmt.Errorf("failed to encode completion start: %w", err)
++	}
++	return &AsynchronousTokenCounter{
++		count: len(tokens),
++	}, nil
++}
++
++// Add increments the token count by one for a streamed completion. It returns
++// an error if the counter has already been finalized.
++func (tc *AsynchronousTokenCounter) Add() error {
++	if tc.finished {
++		return fmt.Errorf("asynchronous token counter has already been finalized")
++	}
++	tc.count++
++	return nil
++}
++
++// TokenCount returns the total number of counted tokens, marks the asynchronous
++// token counter as finished, and prevents any additional tokens from being added.
++// The returned value includes the per-request overhead.
++func (tc *AsynchronousTokenCounter) TokenCount() int {
++	tc.finished = true
++	return tc.count + perRequest
++}

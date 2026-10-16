@@ -1,0 +1,607 @@
+diff --git a/openlibrary/catalog/marc/marc_base.py b/openlibrary/catalog/marc/marc_base.py
+index 55ddc1264..b647b9199 100644
+--- a/openlibrary/catalog/marc/marc_base.py
++++ b/openlibrary/catalog/marc/marc_base.py
+@@ -1,4 +1,5 @@
+ import re
++from typing import Iterator
+ 
+ re_isbn = re.compile(r'([^ ()]+[\dX])(?: \((?:v\. (\d+)(?: : )?)?(.*)\))?')
+ # handle ISBN like: 1402563884c$26.95
+@@ -18,7 +19,46 @@ class NoTitle(MarcException):
+     pass
+ 
+ 
++class MarcFieldBase:
++    """Public base class for MARC field implementations, defining shared
++    subfield access behavior for binary and XML MARC fields."""
++
++    def get_subfields(self, want: str) -> Iterator[tuple[str, str]]:
++        """Yields the field's (code, value) subfield pairs restricted to the
++        subfield codes named in want."""
++        raise NotImplementedError
++
++    def get_subfield_values(self, want: str) -> list[str]:
++        """Returns the stripped values of the field's subfields whose code is
++        named in want, as a list of strings."""
++        return [v for k, v in self.get_subfields(want)]
++
++    def get_contents(self, want: str) -> dict[str, list[str]]:
++        """Returns the field's subfields whose code is named in want, grouped
++        into a mapping from each subfield code to the list of its values."""
++        contents = {}
++        for k, v in self.get_subfields(want):
++            if v:
++                contents.setdefault(k, []).append(v)
++        return contents
++
++    def get_all_subfields(self) -> Iterator[tuple[str, str]]:
++        """Yields every (code, value) subfield pair carried by the field, in
++        order."""
++        raise NotImplementedError
++
++    def get_lower_subfield_values(self) -> Iterator[str]:
++        """Yields the values of every subfield of the field whose code is a
++        lowercase letter."""
++        for k, v in self.get_all_subfields():
++            if k.islower():
++                yield v
++
++
+ class MarcBase:
++    def __init__(self):
++        self.fields: dict[str, list] = {}
++
+     def read_isbn(self, f):
+         found = []
+         for k, v in f.get_subfields(['a', 'z']):
+@@ -31,10 +71,60 @@ class MarcBase:
+         return found
+ 
+     def build_fields(self, want):
++        """Builds a dictionary of fields for the given tag list."""
+         self.fields = {}
+         want = set(want)
+         for tag, line in self.read_fields(want):
+             self.fields.setdefault(tag, []).append(line)
+ 
+     def get_fields(self, tag):
++        """Returns field objects directly without requiring caller to build
++        the field set first."""
+         return [self.decode_field(i) for i in self.fields.get(tag, [])]
++
++    def get_control(self, tag: str) -> str | None:
++        """Returns the first matching control field value, with special
++        handling for duplicate 008 fields by selecting the most relevant
++        40-character entry."""
++        control_fields = self.fields.get(tag, [])
++        if not control_fields:
++            return None
++
++        # Special handling for 008: prefer 40-char entries with fewest spaces
++        if tag == '008' and len(control_fields) > 1:
++            len_40 = [f for f in control_fields if len(f) == 40]
++            if len_40:
++                control_fields = len_40
++            control_fields = [min(control_fields, key=lambda f: f.count(' '))]
++
++        return control_fields[0] if control_fields else None
++
++    def get_linkage(self, original: str, link: str) -> MarcFieldBase | None:
++        """Returns the linked alternate-script 880 field whose subfield 6
++        matches the requested original field linkage.
++
++        A source field and an 880 field are treated as linked when the
++        alternate-script field's subfield 6 begins with the source field's
++        tag, a hyphen and the occurrence number carried by the source field's
++        own subfield 6, which reads 880-<occurrence>; whatever follows that
++        prefix, such as a script identifier, must not affect the match."""
++        # Look for 880 fields
++        fields_880 = self.fields.get('880', [])
++        if not fields_880:
++            return None
++
++        # Decode the fields to get DataField objects
++        decoded_880 = [self.decode_field(f) for f in fields_880]
++
++        for f in decoded_880:
++            # Get subfield 6 from the 880 field
++            sub6_values = f.get_subfield_values('6')
++            if not sub6_values:
++                continue
++
++            sub6 = sub6_values[0]
++            # Check if subfield 6 starts with the original tag and a hyphen
++            if sub6.startswith(original + '-'):
++                return f
++
++        return None
+diff --git a/openlibrary/catalog/marc/marc_binary.py b/openlibrary/catalog/marc/marc_binary.py
+index 6b7764f09..fd950ecab 100644
+--- a/openlibrary/catalog/marc/marc_binary.py
++++ b/openlibrary/catalog/marc/marc_binary.py
+@@ -2,7 +2,7 @@ from pymarc import MARC8ToUnicode
+ from unicodedata import normalize
+ 
+ from openlibrary.catalog.marc import mnemonics
+-from openlibrary.catalog.marc.marc_base import MarcBase, MarcException, BadMARC
++from openlibrary.catalog.marc.marc_base import MarcBase, MarcException, BadMARC, MarcFieldBase
+ 
+ 
+ marc8 = MARC8ToUnicode(quiet=True)
+@@ -38,7 +38,7 @@ def handle_wrapped_lines(_iter):
+     assert not cur_lines
+ 
+ 
+-class BinaryDataField:
++class BinaryDataField(MarcFieldBase):
+     def __init__(self, rec, line):
+         """
+         :param rec MarcBinary:
+diff --git a/openlibrary/catalog/marc/marc_xml.py b/openlibrary/catalog/marc/marc_xml.py
+index 2f7277573..b96fcaf1d 100644
+--- a/openlibrary/catalog/marc/marc_xml.py
++++ b/openlibrary/catalog/marc/marc_xml.py
+@@ -1,7 +1,7 @@
+ from lxml import etree
+ from unicodedata import normalize
+ 
+-from openlibrary.catalog.marc.marc_base import MarcBase, MarcException
++from openlibrary.catalog.marc.marc_base import MarcBase, MarcException, MarcFieldBase
+ 
+ data_tag = '{http://www.loc.gov/MARC21/slim}datafield'
+ control_tag = '{http://www.loc.gov/MARC21/slim}controlfield'
+@@ -33,12 +33,32 @@ def get_text(e):
+     return norm(e.text) if e.text else ''
+ 
+ 
+-class DataField:
+-    def __init__(self, element):
+-        assert element.tag == data_tag
++class DataField(MarcFieldBase):
++    """A field object for XML-backed records that retains a reference to
++    the record it came from."""
++
++    def __init__(self, record=None, element=None):
++        """Construct a field for an XML-backed record.
++        
++        Supports both:
++        - DataField(element) - backwards compatible, record is None
++        - DataField(record, element) - new style with record reference
++        """
++        # Handle backwards compatibility: if first arg is an element, use old signature
++        if record is not None and element is None:
++            # Check if record looks like an lxml element (has tag attribute)
++            if hasattr(record, 'tag') and hasattr(record, 'attrib'):
++                element = record
++                record = None
++        
++        self.record = record
++        if element is not None:
++            assert element.tag == data_tag
+         self.element = element
+ 
+     def remove_brackets(self):
++        if self.element is None:
++            return
+         first = self.element[0]
+         last = self.element[-1]
+         if (
+@@ -142,4 +162,4 @@ class MarcXml(MarcBase):
+         if field.tag == control_tag:
+             return get_text(field)
+         if field.tag == data_tag:
+-            return DataField(field)
++            return DataField(self, field)
+diff --git a/openlibrary/catalog/marc/parse.py b/openlibrary/catalog/marc/parse.py
+index 8d64c472d..4ed1864ac 100644
+--- a/openlibrary/catalog/marc/parse.py
++++ b/openlibrary/catalog/marc/parse.py
+@@ -21,13 +21,76 @@ re_ocn_or_ocm = re.compile(r'^oc[nm]0*(\d+) *$')
+ re_int = re.compile(r'\d{2,}')
+ re_number_dot = re.compile(r'\d{3,}\.$')
+ re_bracket_field = re.compile(r'^\s*(\[.*\])\.?\s*$')
++# Regex to match a subtitle that consists entirely of a bracketed expression
++re_bracket_only_subtitle = re.compile(r'^\[.*\]\.?$')
+ 
+ 
+ def strip_foc(s):
++    """Remove '[from old catalog]' suffix from a string."""
+     foc = '[from old catalog]'
+     return s[: -len(foc)].rstrip() if s.endswith(foc) else s
+ 
+ 
++def remove_catalog_suffix(s):
++    """Remove cataloging suffixes like '[from old catalog]' and trailing punctuation.
++    
++    Returns a tuple of (cleaned_string, had_suffix) where had_suffix indicates
++    whether a [from old catalog] suffix was present."""
++    # Check if there's a cataloging suffix
++    had_foc = s.endswith('[from old catalog]')
++    
++    if had_foc:
++        # Remove the suffix and then strip trailing punctuation
++        s = s[: -len('[from old catalog]')]
++        # Strip surrounding brackets
++        if s.startswith('[') and s.endswith(']'):
++            s = s[1:-1]
++        # Remove trailing punctuation including dots and spaces
++        s = s.rstrip(',.;:')
++        # Also strip any trailing whitespace after punctuation removal
++        s = s.rstrip()
++    else:
++        # If no suffix, just strip surrounding brackets
++        if s.startswith('[') and s.endswith(']'):
++            s = s[1:-1]
++    
++    return s, had_foc
++
++
++def title_from_list(title_parts: list[str], delim: str = ' ') -> str:
++    """Joins title parts with the given delimiter after stripping typical
++    trailing cataloging punctuation from each part, and returns the resulting
++    title string."""
++    STRIP_CHARS = ' /,;:='  # Typical trailing punctuation for 245 subfields in ISBD cataloging standards
++    return delim.join(x.strip(STRIP_CHARS) for x in title_parts).strip()
++
++
++def name_from_list(name_parts: list[str]) -> str:
++    """Joins author name parts into a single name, removing cataloging suffixes
++    such as '[from old catalog]', surrounding brackets and trailing punctuation.
++    
++    If any part had a [from old catalog] suffix, the trailing punctuation is
++    removed from all parts and the final result has no trailing period.
++    Otherwise, the original dots are preserved."""
++    cleaned_parts = []
++    any_had_foc = False
++    
++    for part in name_parts:
++        cleaned, had_foc = remove_catalog_suffix(part)
++        if had_foc:
++            any_had_foc = True
++        if cleaned:
++            cleaned_parts.append(cleaned)
++    
++    result = ' '.join(cleaned_parts)
++    
++    # Always strip trailing period from the joined name
++    # (as per requirement: "the joined name must not end with a period")
++    result = result.rstrip('.')
++    
++    return result
++
++
+ class SeeAlsoAsTitle(MarcException):
+     pass
+ 
+@@ -220,39 +283,111 @@ def read_work_titles(rec):
+ 
+ 
+ def read_title(rec):
++    """Reads title from 245 field, handling linked 880 alternate script fields."""
+     # For cataloging punctuation complexities, see https://www.oclc.org/bibformats/en/onlinecataloging.html#punctuation
+-    STRIP_CHARS = r' /,;:='  # Typical trailing punctuation for 245 subfields in ISBD cataloging standards
++    STRIP_CHARS = ' /,;:='  # Typical trailing punctuation for 245 subfields in ISBD cataloging standards
++    
+     fields = rec.get_fields('245') or rec.get_fields('740')
+     if not fields:
+         raise NoTitle('No Title found in either 245 or 740 fields.')
+-    # example MARC record with multiple titles:
+-    # https://openlibrary.org/show-marc/marc_western_washington_univ/wwu_bibs.mrc_revrev.mrc:299505697:862
+-    contents = fields[0].get_contents(['a', 'b', 'c', 'h', 'n', 'p', 's'])
+-    bnps = [i for i in fields[0].get_subfield_values(['b', 'n', 'p', 's']) if i]
++    
++    # Check if the first 245 field has a linkage to an 880 alternate script field
++    first_field = fields[0]
++    contents = first_field.get_contents(['a', 'b', 'c', 'h', 'n', 'p', 's'])
++    
++    # Check for subfield 6 linkage
++    sub6_values = first_field.get_subfield_values('6')
++    linked_880 = None
++    if sub6_values:
++        sub6 = sub6_values[0]
++        # The 880 field's subfield 6 should start with "245-" followed by occurrence and optional script
++        linked_880 = rec.get_linkage('245', sub6)
++    
++    # Collect alternate titles from various sources
++    other_titles = []
++    
++    # Handle alternate titles from 246, 730, 740
++    for f in rec.get_fields('246'):
++        val = ' '.join(f.get_subfield_values(['a']))
++        if val:
++            other_titles.append(val)
++    for f in rec.get_fields('730'):
++        val = ' '.join(f.get_lower_subfield_values())
++        if val:
++            other_titles.append(val)
++    for f in rec.get_fields('740'):
++        val = ' '.join(f.get_subfield_values(['a', 'p', 'n']))
++        if val:
++            other_titles.append(val)
++    
++    # Handle alternate titles from linked 880 fields
++    if linked_880:
++        linked_contents = linked_880.get_contents(['a', 'b', 'n', 'p', 's'])
++        # Add 880 title parts as alternate titles
++        for key in ['a', 'n', 'p']:
++            if key in linked_contents:
++                other_titles.extend(linked_contents[key])
++    
++    bnps = [i for i in first_field.get_subfield_values(['b', 'n', 'p', 's']) if i]
+     ret = {}
+     title = None
++    
+     # MARC record with 245a missing:
+     # https://openlibrary.org/show-marc/marc_western_washington_univ/wwu_bibs.mrc_revrev.mrc:516779055:1304
+     if 'a' in contents:
+         title = ' '.join(x.strip(STRIP_CHARS) for x in contents['a'])
+     elif bnps:
+         title = bnps.pop(0).strip(STRIP_CHARS)
++    
+     # talis_openlibrary_contribution/talis-openlibrary-contribution.mrc:183427199:255
+     if title in ('See.', 'See also.'):
+         raise SeeAlsoAsTitle('Title is: %s' % title)
++    
+     # talis_openlibrary_contribution/talis-openlibrary-contribution.mrc:5654086:483
+     if title is None:
+-        subfields = list(fields[0].get_all_subfields())
++        subfields = list(first_field.get_all_subfields())
+         title = ' '.join(v for k, v in subfields)
+         if not title:  # ia:scrapbooksofmoun03tupp
+             raise NoTitle('No title found from joining subfields.')
+-    ret['title'] = remove_trailing_dot(title)
++    
++    # When linked to 880, use the 880 title as primary and Latin-script as alternate
++    if linked_880:
++        linked_a_values = linked_880.get_subfield_values('a')
++        if linked_a_values:
++            # Use the alternate-script title as the main title
++            ret['title'] = remove_trailing_dot(linked_a_values[0].strip(STRIP_CHARS))
++            # Keep the Latin-script title as an alternate
++            if 'a' in contents:
++                latin_title = remove_trailing_dot(
++                    ' '.join(x.strip(STRIP_CHARS) for x in contents['a'])
++                )
++                if latin_title != ret['title']:
++                    other_titles.insert(0, latin_title)
++        else:
++            ret['title'] = remove_trailing_dot(title)
++    else:
++        ret['title'] = remove_trailing_dot(title)
++    
++    # Handle subtitle - only include if not just a bracketed expression
++    subtitle_parts = []
+     if bnps:
+-        ret['subtitle'] = ' : '.join(
+-            remove_trailing_dot(x.strip(STRIP_CHARS)) for x in bnps
+-        )
++        subtitle_parts = [remove_trailing_dot(x.strip(STRIP_CHARS)) for x in bnps]
++    
++    # Also check linked 880 for subtitle if the original has none
++    if linked_880 and not subtitle_parts:
++        linked_bnps = linked_880.get_subfield_values(['b', 'n', 'p', 's'])
++        if linked_bnps:
++            subtitle_parts = [remove_trailing_dot(x.strip(STRIP_CHARS)) for x in linked_bnps if x]
++    
++    # Only add subtitle if it's not just a bracketed expression
++    if subtitle_parts:
++        subtitle = ' : '.join(subtitle_parts)
++        if not re_bracket_only_subtitle.match(subtitle):
++            ret['subtitle'] = subtitle
++    
+     if 'c' in contents:
+         ret['by_statement'] = remove_trailing_dot(' '.join(contents['c']))
++    
+     if 'h' in contents:
+         h = ' '.join(contents['h']).strip(' ')
+         m = re_bracket_field.match(h)
+@@ -260,6 +395,11 @@ def read_title(rec):
+             h = m.group(1)
+         assert h
+         ret['physical_format'] = h
++    
++    # Add other titles if any
++    if other_titles:
++        ret['other_titles'] = other_titles
++    
+     return ret
+ 
+ 
+@@ -337,9 +477,19 @@ def read_pub_date(rec):
+ 
+ 
+ def read_publisher(rec):
++    """Reads publisher and place from 260/264, falling back to linked 880 fields."""
+     fields = rec.get_fields('260') or rec.get_fields('264')[:1]
++    if not fields:
++        # Try to get from linked 880 field if no 260/264 exists
++        fields_880 = rec.get_linkage('260', '')
++        if not fields_880:
++            fields_880 = rec.get_linkage('264', '')
++        if fields_880:
++            fields = [fields_880]
++    
+     if not fields:
+         return
++    
+     publisher = []
+     publish_places = []
+     for f in fields:
+@@ -349,8 +499,11 @@ def read_publisher(rec):
+             publisher += [x.strip(" /,;:") for x in contents['b']]
+         if 'a' in contents:
+             publish_places += [x.strip(" /.,;:") for x in contents['a'] if x]
++    
+     edition = {}
+     if publisher:
++        # Handle standard abbreviation for unknown publisher
++        publisher = [p if p != '[s-n-]' else '[s.n.]' for p in publisher]
+         edition["publishers"] = publisher
+     if len(publish_places) and publish_places[0]:
+         edition["publish_places"] = publish_places
+@@ -358,20 +511,36 @@ def read_publisher(rec):
+ 
+ 
+ def read_author_person(f):
++    """Reads person author from a 100/700/720 field."""
+     f.remove_brackets()
+     author = {}
+     contents = f.get_contents(['a', 'b', 'c', 'd', 'e'])
++    
+     if 'a' not in contents and 'c' not in contents:
+         return  # should at least be a name or title
++    
++    # Check for linkage to 880 alternate script field
++    sub6_values = f.get_subfield_values('6')
++    linked_880 = None
++    if sub6_values and f.record is not None:
++        sub6 = sub6_values[0]
++        # Determine the field tag
++        tag = '100' if hasattr(f, 'element') and 'tag' in f.element.attrib else '100'
++        linked_880 = f.record.get_linkage(tag, sub6)
++    
+     name = [v.strip(' /,;:') for v in f.get_subfield_values(['a', 'b', 'c'])]
++    
+     if 'd' in contents:
+         author = pick_first_date(strip_foc(d).strip(',') for d in contents['d'])
+         if 'death_date' in author and author['death_date']:
+             death_date = author['death_date']
+             if re_number_dot.search(death_date):
+                 author['death_date'] = death_date[:-1]
+-    author['name'] = ' '.join(name)
++    
++    # Join name parts using name_from_list for proper cleanup
++    author['name'] = name_from_list(name)
+     author['entity_type'] = 'person'
++    
+     subfields = [
+         ('a', 'personal_name'),
+         ('b', 'numeration'),
+@@ -381,13 +550,32 @@ def read_author_person(f):
+     for subfield, field_name in subfields:
+         if subfield in contents:
+             author[field_name] = remove_trailing_dot(
+-                ' '.join([x.strip(' /,;:') for x in contents[subfield]])
++                name_from_list([x.strip(' /,;:') for x in contents[subfield]])
+             )
++    
+     if 'q' in contents:
+         author['fuller_name'] = ' '.join(contents['q'])
+-    for f in 'name', 'personal_name':
+-        if f in author:
+-            author[f] = remove_trailing_dot(strip_foc(author[f]))
++    
++    # Clean up name fields
++    for f_key in 'name', 'personal_name':
++        if f_key in author:
++            author[f_key] = remove_trailing_dot(strip_foc(author[f_key]))
++    
++    # Add alternate names from linked 880 field
++    if linked_880:
++        linked_a_values = linked_880.get_subfield_values('a')
++        if linked_a_values:
++            # Apply same cleanup as primary name, but keep dots
++            cleaned_names = []
++            for val in linked_a_values:
++                cleaned = val.strip(' /,;:')
++                # Remove trailing punctuation but keep dots
++                cleaned = cleaned.rstrip(',;:')
++                if cleaned:
++                    cleaned_names.append(cleaned)
++            if cleaned_names:
++                author['alternate_names'] = cleaned_names
++    
+     return author
+ 
+ 
+@@ -410,6 +598,7 @@ def last_name_in_245c(rec, person):
+ 
+ 
+ def read_authors(rec):
++    """Reads authors from 100, 110, 111 fields."""
+     count = 0
+     fields_100 = rec.get_fields('100')
+     fields_110 = rec.get_fields('110')
+@@ -426,13 +615,13 @@ def read_authors(rec):
+         f.remove_brackets()
+         name = [v.strip(' /,;:') for v in f.get_subfield_values(['a', 'b'])]
+         found.append(
+-            {'entity_type': 'org', 'name': remove_trailing_dot(' '.join(name))}
++            {'entity_type': 'org', 'name': name_from_list(name)}
+         )
+     for f in fields_111:
+         f.remove_brackets()
+         name = [v.strip(' /,;:') for v in f.get_subfield_values(['a', 'c', 'd', 'n'])]
+         found.append(
+-            {'entity_type': 'event', 'name': remove_trailing_dot(' '.join(name))}
++            {'entity_type': 'event', 'name': name_from_list(name)}
+         )
+     if found:
+         return found
+@@ -461,6 +650,7 @@ def read_pagination(rec):
+ 
+ 
+ def read_series(rec):
++    """Reads series from 440, 490, 830 fields with cleanup and deduplication."""
+     found = []
+     for tag in ('440', '490', '830'):
+         fields = rec.get_fields(tag)
+@@ -472,15 +662,17 @@ def read_series(rec):
+                 if k == 'v' and v:
+                     this.append(v)
+                     continue
++                # Remove trailing punctuation and whitespace
+                 v = v.rstrip('.,; ')
+                 if v:
+                     this.append(v)
+             if this:
+-                found += [' -- '.join(this)]
+-    return found
++                found.append(' -- '.join(this))
++    return remove_duplicates(found)
+ 
+ 
+ def read_notes(rec):
++    """Reads notes from fields 500-589, excluding 505 and 520."""
+     found = []
+     for tag in range(500, 595):
+         if tag in (505, 520):
+@@ -579,7 +771,7 @@ def read_contributions(rec):
+             if tag == '710':
+                 name = [v.strip(' /,;:') for v in f.get_subfield_values(want[tag])]
+                 ret['authors'] = [
+-                    {'entity_type': 'org', 'name': remove_trailing_dot(' '.join(name))}
++                    {'entity_type': 'org', 'name': name_from_list(name)}
+                 ]
+                 skip_authors.add(tuple(f.get_subfields(want[tag])))
+                 break
+@@ -588,7 +780,7 @@ def read_contributions(rec):
+                 ret['authors'] = [
+                     {
+                         'entity_type': 'event',
+-                        'name': remove_trailing_dot(' '.join(name)),
++                        'name': name_from_list(name),
+                     }
+                 ]
+                 skip_authors.add(tuple(f.get_subfields(want[tag])))
+@@ -663,15 +855,19 @@ def read_edition(rec):
+     handle_missing_008 = True
+     rec.build_fields(FIELDS_WANTED)
+     edition = {}
++    
++    # Handle 008 field
+     tag_008 = rec.get_fields('008')
+     if len(tag_008) == 0:
+         if not handle_missing_008:
+             raise BadMARC("single '008' field required")
+     if len(tag_008) > 1:
++        # Prefer 40-character entries with fewest spaces
+         len_40 = [f for f in tag_008 if len(f) == 40]
+         if len_40:
+             tag_008 = len_40
+         tag_008 = [min(tag_008, key=lambda f: f.count(' '))]
++    
+     if len(tag_008) == 1:
+         # assert len(tag_008[0]) == 40
+         f = re_bad_char.sub(' ', tag_008[0])

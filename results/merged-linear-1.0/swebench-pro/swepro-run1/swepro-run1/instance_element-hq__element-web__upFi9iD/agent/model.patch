@@ -1,0 +1,281 @@
+diff --git a/src/components/structures/RoomSearchView.tsx b/src/components/structures/RoomSearchView.tsx
+index 81e76ddfb9..0835cdf3f7 100644
+--- a/src/components/structures/RoomSearchView.tsx
++++ b/src/components/structures/RoomSearchView.tsx
+@@ -19,6 +19,7 @@ import { ISearchResults } from "matrix-js-sdk/src/@types/search";
+ import { IThreadBundledRelationship } from "matrix-js-sdk/src/models/event";
+ import { THREAD_RELATION_TYPE } from "matrix-js-sdk/src/models/thread";
+ import { logger } from "matrix-js-sdk/src/logger";
++import { MatrixEvent } from "matrix-js-sdk/src/models/event";
+ 
+ import ScrollPanel from "./ScrollPanel";
+ import { SearchScope } from "../views/rooms/SearchBar";
+@@ -55,8 +56,13 @@ interface Props {
+     onUpdate(inProgress: boolean, results: ISearchResults | null): void;
+ }
+ 
+-// XXX: todo: merge overlapping results somehow?
+-// XXX: why doesn't searching on name work?
++// Data structure for merged search results
++interface MergedSearchResult {
++    timeline: MatrixEvent[];
++    ourEventsIndexes: number[];
++    searchResult: ISearchResults["results"][number];
++}
++
+ export const RoomSearchView = forwardRef<ScrollPanel, Props>(
+     (
+         { term, scope, promise, abortController, resizeNotifier, permalinkCreator, className, onUpdate }: Props,
+@@ -213,7 +219,81 @@ export const RoomSearchView = forwardRef<ScrollPanel, Props>(
+             scrollPanel?.checkScroll();
+         };
+ 
+-        let lastRoomId: string;
++        /**
++         * Groups consecutive search results that can be merged together.
++         * Merging occurs when the last event_id of one result matches the first event_id of the next result.
++         * This creates a list of merged results, where each merged result may contain
++         * multiple original search results that were consecutive and overlapping.
++         *
++         * @param searchResults - Array of search results to group (in the order they should be displayed)
++         * @returns Array of merged search results
++         */
++        const groupSearchResults = (searchResults: ISearchResults["results"]): MergedSearchResult[] => {
++            if (!searchResults || searchResults.length === 0) {
++                return [];
++            }
++
++            const grouped: MergedSearchResult[] = [];
++            let currentGroup: MergedSearchResult | null = null;
++
++            // Process results in order (first to last)
++            // Results are displayed in reverse chronological order in the UI,
++            // so we iterate through them in the order they appear
++            for (let i = 0; i < searchResults.length; i++) {
++                const result = searchResults[i];
++                const timeline = result.context.getTimeline();
++
++                if (!currentGroup) {
++                    // Start a new group with this result
++                    currentGroup = {
++                        timeline: [...timeline],
++                        ourEventsIndexes: [result.context.getOurEventIndex()],
++                        searchResult: result,
++                    };
++                } else {
++                    // Check if we can merge this result with the current group
++                    // The last event of the current group should match the first event of the new result
++                    const lastEventInGroup = currentGroup.timeline[currentGroup.timeline.length - 1];
++                    const firstEventInCurrentResult = timeline[0];
++
++                    if (lastEventInGroup.getId() === firstEventInCurrentResult.getId()) {
++                        // Merge: append the current result's timeline (skipping the pivot event at index 0)
++                        const offset = currentGroup.timeline.length;
++                        const resultEventIndex = result.context.getOurEventIndex();
++
++                        // Append events from the new result starting at index 1 (skip pivot)
++                        for (let j = 1; j < timeline.length; j++) {
++                            currentGroup.timeline.push(timeline[j]);
++                        }
++
++                        // Add the result's match index, adjusted by the offset
++                        // Subtract 1 because we're skipping the pivot (index 0 of the new result)
++                        if (resultEventIndex > 0) {
++                            currentGroup.ourEventsIndexes.push(offset + resultEventIndex - 1);
++                        }
++                        // If the match is at index 0 (the pivot), it's already counted from previous merge
++                    } else {
++                        // Cannot merge: push current group and start a new one
++                        grouped.push(currentGroup);
++                        currentGroup = {
++                            timeline: [...timeline],
++                            ourEventsIndexes: [result.context.getOurEventIndex()],
++                            searchResult: result,
++                        };
++                    }
++                }
++            }
++
++            // Don't forget the last group
++            if (currentGroup) {
++                grouped.push(currentGroup);
++            }
++
++            return grouped;
++        };
++
++        // Filter valid results and collect them
++        const validResults: ISearchResults["results"] = [];
+ 
+         for (let i = (results?.results?.length || 0) - 1; i >= 0; i--) {
+             const result = results.results[i];
+@@ -236,12 +316,27 @@ export const RoomSearchView = forwardRef<ScrollPanel, Props>(
+                 continue;
+             }
+ 
++            validResults.push(result);
++        }
++
++        // Group consecutive results that can be merged
++        const groupedResults = groupSearchResults(validResults);
++
++        let lastRoomId: string;
++
++        // Render grouped results
++        for (let g = 0; g < groupedResults.length; g++) {
++            const group = groupedResults[g];
++            const firstEvent = group.timeline[0];
++            const roomId = firstEvent.getRoomId();
++            const room = client.getRoom(roomId);
++
+             if (scope === SearchScope.All) {
+                 if (roomId !== lastRoomId) {
+                     ret.push(
+-                        <li key={mxEv.getId() + "-room"}>
++                        <li key={firstEvent.getId() + "-room"}>
+                             <h2>
+-                                {_t("Room")}: {room.name}
++                                {_t("Room")}: {room?.name}
+                             </h2>
+                         </li>,
+                     );
+@@ -249,12 +344,14 @@ export const RoomSearchView = forwardRef<ScrollPanel, Props>(
+                 }
+             }
+ 
+-            const resultLink = "#/room/" + roomId + "/" + mxEv.getId();
++            // Use the searchResult from the last result in the group for permalink
++            const resultLink = "#/room/" + roomId + "/" + firstEvent.getId();
+ 
+             ret.push(
+                 <SearchResultTile
+-                    key={mxEv.getId()}
+-                    searchResult={result}
++                    key={firstEvent.getId() + "-group"}
++                    timeline={group.timeline}
++                    ourEventsIndexes={group.ourEventsIndexes}
+                     searchHighlights={highlights}
+                     resultLink={resultLink}
+                     permalinkCreator={permalinkCreator}
+diff --git a/src/components/views/rooms/SearchResultTile.tsx b/src/components/views/rooms/SearchResultTile.tsx
+index ccab281c53..b67872a6e2 100644
+--- a/src/components/views/rooms/SearchResultTile.tsx
++++ b/src/components/views/rooms/SearchResultTile.tsx
+@@ -31,13 +31,17 @@ import { haveRendererForEvent } from "../../../events/EventTileFactory";
+ 
+ interface IProps {
+     // a matrix-js-sdk SearchResult containing the details of this result
+-    searchResult: SearchResult;
++    searchResult?: SearchResult;
+     // a list of strings to be highlighted in the results
+     searchHighlights?: string[];
+     // href for the highlights in this result
+     resultLink?: string;
+     onHeightChanged?: () => void;
+     permalinkCreator?: RoomPermalinkCreator;
++    // When merging search results, use these props instead of searchResult
++    timeline?: MatrixEvent[];
++    // Indices in the timeline that correspond to direct query matches (for highlighting)
++    ourEventsIndexes?: number[];
+ }
+ 
+ export default class SearchResultTile extends React.Component<IProps> {
+@@ -50,7 +54,9 @@ export default class SearchResultTile extends React.Component<IProps> {
+     public constructor(props, context) {
+         super(props, context);
+ 
+-        this.buildLegacyCallEventGroupers(this.props.searchResult.context.getTimeline());
++        // Use merged timeline if provided, otherwise fall back to searchResult
++        const timeline = props.timeline ?? props.searchResult?.context.getTimeline();
++        this.buildLegacyCallEventGroupers(timeline);
+     }
+ 
+     private buildLegacyCallEventGroupers(events?: MatrixEvent[]): void {
+@@ -58,29 +64,41 @@ export default class SearchResultTile extends React.Component<IProps> {
+     }
+ 
+     public render() {
+-        const result = this.props.searchResult;
+-        const resultEvent = result.context.getEvent();
+-        const eventId = resultEvent.getId();
++        const { searchResult, timeline, ourEventsIndexes, searchHighlights, resultLink } = this.props;
+ 
+-        const ts1 = resultEvent.getTs();
+-        const ret = [<DateSeparator key={ts1 + "-search"} roomId={resultEvent.getRoomId()} ts={ts1} />];
++        // Use merged timeline if provided, otherwise use searchResult's timeline
++        const mergedTimeline = timeline ?? searchResult?.context.getTimeline();
++        if (!mergedTimeline || mergedTimeline.length === 0) {
++            return null;
++        }
++
++        // Use ourEventsIndexes if provided (merged results), otherwise use the single match index from searchResult
++        const matchIndexes = ourEventsIndexes !== undefined ? ourEventsIndexes : [searchResult?.context.getOurEventIndex() ?? 0];
++
++        // Get the first event to determine roomId and timestamp for date separator
++        const firstEvent = mergedTimeline[0];
++        const roomId = firstEvent.getRoomId();
++        const ts1 = firstEvent.getTs();
++
++        const ret = [<DateSeparator key={ts1 + "-search"} roomId={roomId} ts={ts1} />];
+         const layout = SettingsStore.getValue("layout");
+         const isTwelveHour = SettingsStore.getValue("showTwelveHourTimestamps");
+         const alwaysShowTimestamps = SettingsStore.getValue("alwaysShowTimestamps");
+         const threadsEnabled = SettingsStore.getValue("feature_threadstable");
+ 
+-        const timeline = result.context.getTimeline();
+-        for (let j = 0; j < timeline.length; j++) {
+-            const mxEv = timeline[j];
++        for (let j = 0; j < mergedTimeline.length; j++) {
++            const mxEv = mergedTimeline[j];
+             let highlights;
+-            const contextual = j != result.context.getOurEventIndex();
+-            if (!contextual) {
+-                highlights = this.props.searchHighlights;
++            // Check if this event is a direct match (for highlighting)
++            const isMatch = matchIndexes.includes(j);
++            const contextual = !isMatch;
++            if (isMatch) {
++                highlights = searchHighlights;
+             }
+ 
+             if (haveRendererForEvent(mxEv, this.context?.showHiddenEvents)) {
+                 // do we need a date separator since the last event?
+-                const prevEv = timeline[j - 1];
++                const prevEv = mergedTimeline[j - 1];
+                 // is this a continuation of the previous message?
+                 const continuation =
+                     prevEv &&
+@@ -94,7 +112,7 @@ export default class SearchResultTile extends React.Component<IProps> {
+                     );
+ 
+                 let lastInSection = true;
+-                const nextEv = timeline[j + 1];
++                const nextEv = mergedTimeline[j + 1];
+                 if (nextEv) {
+                     const willWantDateSeparator = wantsDateSeparator(mxEv.getDate(), nextEv.getDate());
+                     lastInSection =
+@@ -111,13 +129,13 @@ export default class SearchResultTile extends React.Component<IProps> {
+ 
+                 ret.push(
+                     <EventTile
+-                        key={`${eventId}+${j}`}
++                        key={`${mxEv.getId()}+${j}`}
+                         mxEvent={mxEv}
+                         layout={layout}
+                         contextual={contextual}
+                         highlights={highlights}
+                         permalinkCreator={this.props.permalinkCreator}
+-                        highlightLink={this.props.resultLink}
++                        highlightLink={resultLink}
+                         onHeightChanged={this.props.onHeightChanged}
+                         isTwelveHour={isTwelveHour}
+                         alwaysShowTimestamps={alwaysShowTimestamps}
+@@ -130,7 +148,7 @@ export default class SearchResultTile extends React.Component<IProps> {
+         }
+ 
+         return (
+-            <li data-scroll-tokens={eventId}>
++            <li data-scroll-tokens={firstEvent.getId()}>
+                 <ol>{ret}</ol>
+             </li>
+         );

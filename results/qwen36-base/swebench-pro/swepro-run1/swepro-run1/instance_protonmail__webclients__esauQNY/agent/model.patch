@@ -1,0 +1,301 @@
+diff --git a/packages/components/components/v2/input/TotpInput.tsx b/packages/components/components/v2/input/TotpInput.tsx
+index 8b677b5d7..4cf74b328 100644
+--- a/packages/components/components/v2/input/TotpInput.tsx
++++ b/packages/components/components/v2/input/TotpInput.tsx
+@@ -1,26 +1,25 @@
+-import { ReactNode } from 'react';
+-
+-import InputTwo from './Input';
+-
+-const getIsValidValue = (value: string, type: TotpInputProps['type']) => {
+-    if (type === 'number') {
+-        return /[0-9]/.test(value);
+-    }
+-    return /[0-9A-Za-z]/.test(value);
+-};
++import React, { useRef, useEffect, useCallback } from 'react';
+ 
+ interface TotpInputProps {
+     length: number;
+     value: string;
+     id?: string;
+-    error?: ReactNode | boolean;
++    error?: React.ReactNode | boolean;
+     onValue: (value: string) => void;
+     type?: 'number' | 'alphabet';
+     disableChange?: boolean;
+     autoFocus?: boolean;
+     autoComplete?: 'one-time-code';
++    className?: string;
+ }
+ 
++const isValidChar = (char: string, type: 'number' | 'alphabet'): boolean => {
++    if (type === 'number') {
++        return /^[0-9]$/.test(char);
++    }
++    return /^[0-9A-Za-z]$/.test(char);
++};
++
+ const TotpInput = ({
+     value = '',
+     length,
+@@ -30,32 +29,236 @@ const TotpInput = ({
+     disableChange,
+     autoFocus,
+     autoComplete,
+-    error,
++    className,
+ }: TotpInputProps) => {
+-    return (
+-        <InputTwo
+-            id={id}
+-            error={error}
+-            value={value}
+-            onChange={(event) => {
+-                if (disableChange) {
+-                    return;
++    const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
++    inputRefs.current = inputRefs.current.slice(0, length);
++
++    // Get the normalized value padded with spaces
++    const getValue = useCallback(() => {
++        let normalizedValue = value;
++        // Pad value with spaces up to length
++        while (normalizedValue.length < length) {
++            normalizedValue += ' ';
++        }
++        // Truncate value to length
++        return normalizedValue.slice(0, length);
++    }, [value, length]);
++
++    const updateValue = useCallback(
++        (newValue: string) => {
++            const normalized = newValue.padEnd(length, ' ').slice(0, length);
++            onValue(normalized);
++        },
++        [length, onValue]
++    );
++
++    // Handle keydown events
++    const handleKeyDown = useCallback(
++        (e: React.KeyboardEvent<HTMLInputElement>, index: number) => {
++            if (disableChange) {
++                return;
++            }
++
++            const currentValue = getValue();
++            const element = e.target as HTMLInputElement;
++            const selectionStart = element.selectionStart ?? 0;
++            const selectionEnd = element.selectionEnd ?? 0;
++
++            // Handle backspace
++            if (e.key === 'Backspace') {
++                e.preventDefault();
++
++                // If selection start is at 0, clear previous field and move focus there
++                if (selectionStart === 0 || selectionStart === selectionEnd) {
++                    if (index > 0) {
++                        const prevValue = currentValue;
++                        const newVal = prevValue.slice(0, index - 1) + ' ' + prevValue.slice(index);
++                        updateValue(newVal);
++                        inputRefs.current[index - 1]?.focus();
++                    }
++                } else {
++                    // Selection is within the field - delete selected chars
++                    const newVal = currentValue.slice(0, selectionStart) + currentValue.slice(selectionEnd);
++                    updateValue(newVal);
++                }
++                return;
++            }
++
++            // Handle arrow keys
++            if (e.key === 'ArrowLeft' && index > 0) {
++                e.preventDefault();
++                inputRefs.current[index - 1]?.focus();
++                return;
++            }
++            if (e.key === 'ArrowRight' && index < length - 1) {
++                e.preventDefault();
++                inputRefs.current[index + 1]?.focus();
++                return;
++            }
++
++            // Ignore other special keys
++            if (
++                e.key.length > 1 &&
++                e.key !== 'Enter' &&
++                e.key !== 'Tab' &&
++                !e.ctrlKey &&
++                !e.metaKey
++            ) {
++                return;
++            }
++        },
++        [disableChange, getValue, updateValue, length]
++    );
++
++    // Handle input event for typed characters
++    const handleInput = useCallback(
++        (e: React.FormEvent<HTMLInputElement>, index: number) => {
++            if (disableChange) {
++                return;
++            }
++
++            const element = e.target as HTMLInputElement;
++            const currentValue = getValue();
++
++            // Get the character that was entered
++            const char = element.value;
++
++            if (char === '' || char === ' ') {
++                // Empty input - do nothing on value change
++                return;
++            }
++
++            // Only consider the last character entered
++            const lastChar = char.slice(-1);
++
++            if (!isValidChar(lastChar, type)) {
++                // Invalid character - restore field to current value
++                element.value = currentValue[index];
++                return;
++            }
++
++            // Clear the input element and update value
++            element.value = '';
++
++            // Update the value at this position
++            const newVal = currentValue.slice(0, index) + lastChar + currentValue.slice(index + 1);
++            updateValue(newVal);
++
++            // Move to next field if exists
++            if (index < length - 1) {
++                inputRefs.current[index + 1]?.focus();
++            }
++        },
++        [disableChange, getValue, updateValue, length, type]
++    );
++
++    // Handle paste event
++    const handlePaste = useCallback(
++        (e: React.ClipboardEvent<HTMLInputElement>, index: number) => {
++            if (disableChange) {
++                return;
++            }
++
++            e.preventDefault();
++
++            const currentValue = getValue();
++            const pastedText = e.clipboardData.getData('text');
++
++            if (!pastedText) {
++                return;
++            }
++
++            // Filter valid characters
++            const validChars: string[] = [];
++            for (const char of pastedText) {
++                if (isValidChar(char, type)) {
++                    validChars.push(char);
+                 }
+-                const newValue = event.target.value.replaceAll(/s+/g, '');
+-                if (!getIsValidValue(newValue, type) && newValue !== '') {
+-                    return;
++            }
++
++            if (validChars.length === 0) {
++                return;
++            }
++
++            // Fill consecutive fields starting at current index
++            const end = Math.min(index + validChars.length, length);
++            let filledFields = 0;
++
++            for (let i = index; i < end; i++) {
++                if (filledFields < validChars.length) {
++                    const newVal =
++                        currentValue.slice(0, i) +
++                        validChars[filledFields] +
++                        currentValue.slice(i + 1);
++                    updateValue(newVal);
++                    filledFields++;
+                 }
+-                onValue(newValue);
+-            }}
+-            autoFocus={autoFocus}
+-            autoComplete={autoComplete}
+-            autoCapitalize="off"
+-            autoCorrect="off"
+-            spellCheck="false"
+-            type={type === 'number' ? 'tel' : 'text'}
+-            inputMode={type === 'number' ? 'numeric' : undefined}
+-            maxLength={length}
+-        />
++            }
++
++            // Focus the field after the last filled one (or last field if full)
++            const focusIndex = Math.min(index + filledFields, length - 1);
++            inputRefs.current[focusIndex]?.focus();
++        },
++        [disableChange, getValue, updateValue, length, type]
++    );
++
++    // Focus first field on mount if autoFocus is true
++    useEffect(() => {
++        if (autoFocus && inputRefs.current[0]) {
++            inputRefs.current[0].focus();
++        }
++    }, [autoFocus]);
++
++    // Handle value prop changes - update all fields
++    useEffect(() => {
++        const currentValue = getValue();
++        for (let i = 0; i < length; i++) {
++            const input = inputRefs.current[i];
++            if (!input) {
++                continue;
++            }
++
++            const char = currentValue[i];
++            const displayChar = isValidChar(char, type) ? char : '';
++
++            if (input.value !== displayChar) {
++                input.value = displayChar;
++            }
++        }
++    }, [value, length, type, getValue]);
++
++    return (
++        <div className={`totp-input${className ? ` ${className}` : ''}`}>
++            {Array.from({ length }, (_, index) => {
++                const currentValue = getValue();
++                const char = currentValue[index];
++                const displayChar = isValidChar(char, type) ? char : '';
++
++                return (
++                    <input
++                        key={index}
++                        ref={(el) => {
++                            inputRefs.current[index] = el;
++                        }}
++                        type={type === 'number' ? 'tel' : 'text'}
++                        id={id ? `${id}-${index}` : undefined}
++                        maxLength={1}
++                        autoComplete={index === 0 ? autoComplete : undefined}
++                        autoCapitalize="off"
++                        autoCorrect="off"
++                        spellCheck={false}
++                        inputMode={type === 'number' ? 'numeric' : undefined}
++                        className="totp-input-field"
++                        onKeyDown={(e) => handleKeyDown(e, index)}
++                        onInput={(e) => handleInput(e, index)}
++                        onPaste={(e) => handlePaste(e, index)}
++                        value={displayChar}
++                        data-testid={`totp-input-${index}`}
++                    />
++                );
++            })}
++        </div>
+     );
+ };
+ 

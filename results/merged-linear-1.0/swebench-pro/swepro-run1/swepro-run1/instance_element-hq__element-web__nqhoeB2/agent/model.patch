@@ -1,0 +1,316 @@
+diff --git a/res/css/components/views/settings/devices/_FilteredDeviceListHeader.pcss b/res/css/components/views/settings/devices/_FilteredDeviceListHeader.pcss
+index 2cdbcf356f..ecf092bd0f 100644
+--- a/res/css/components/views/settings/devices/_FilteredDeviceListHeader.pcss
++++ b/res/css/components/views/settings/devices/_FilteredDeviceListHeader.pcss
+@@ -34,3 +34,25 @@ limitations under the License.
+ .mx_FilteredDeviceListHeader_label {
+     flex: 1 1 100%;
+ }
++
++.mx_FilteredDeviceListHeader_actions {
++    display: flex;
++    flex-direction: row;
++    gap: $spacing-8;
++}
++
++.mx_FilteredDeviceListHeader_action {
++    padding: $spacing-4 $spacing-8;
++    border: none;
++    border-radius: 4px;
++    cursor: pointer;
++    font-size: inherit;
++    
++    &:hover {
++        background-color: $system-hover;
++    }
++    
++    &:active {
++        background-color: $system-active;
++    }
++}
+diff --git a/src/components/views/settings/devices/DeviceTile.tsx b/src/components/views/settings/devices/DeviceTile.tsx
+index e48070ddbc..40cb4724bd 100644
+--- a/src/components/views/settings/devices/DeviceTile.tsx
++++ b/src/components/views/settings/devices/DeviceTile.tsx
+@@ -54,13 +54,11 @@ const getInactiveMetadata = (device: DeviceWithVerification): { id: string, valu
+         return undefined;
+     }
+     return { id: 'inactive', value: (
+-        <>
+-            <InactiveIcon className="mx_DeviceTile_inactiveIcon" />
++        <><InactiveIcon className="mx_DeviceTile_inactiveIcon" />
+             {
+                 _t('Inactive for %(inactiveAgeDays)s+ days', { inactiveAgeDays: INACTIVE_DEVICE_AGE_DAYS }) +
+                 ` (${formatLastActivity(device.last_seen_ts)})`
+-            }
+-        </>),
++            }</>),
+     };
+ };
+ 
+diff --git a/src/components/views/settings/devices/FilteredDeviceList.tsx b/src/components/views/settings/devices/FilteredDeviceList.tsx
+index 5ec0a428d0..56c346c117 100644
+--- a/src/components/views/settings/devices/FilteredDeviceList.tsx
++++ b/src/components/views/settings/devices/FilteredDeviceList.tsx
+@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ 
+-import React, { ForwardedRef, forwardRef } from 'react';
++import React, { ForwardedRef, forwardRef, useCallback, useMemo, useState } from 'react';
+ import { IPusher } from 'matrix-js-sdk/src/@types/PushRules';
+ import { PUSHER_DEVICE_ID } from 'matrix-js-sdk/src/@types/event';
+ import { LocalNotificationSettings } from 'matrix-js-sdk/src/@types/local_notifications';
+@@ -37,6 +37,7 @@ import {
+ } from './types';
+ import { DevicesState } from './useOwnDevices';
+ import FilteredDeviceListHeader from './FilteredDeviceListHeader';
++import SelectableDeviceTile from './SelectableDeviceTile';
+ 
+ interface Props {
+     devices: DevicesDictionary;
+@@ -118,28 +119,23 @@ const getNoResultsMessage = (filter?: DeviceSecurityVariation): string => {
+         case DeviceSecurityVariation.Inactive:
+             return _t('No inactive sessions found.');
+         default:
+-            return _t('No sessions found.');
++            return _t('No results.');
+     }
+ };
+-interface NoResultsProps { filter?: DeviceSecurityVariation, clearFilter: () => void}
+-const NoResults: React.FC<NoResultsProps> = ({ filter, clearFilter }) =>
+-    <div className='mx_FilteredDeviceList_noResults'>
+-        { getNoResultsMessage(filter) }
+-        {
+-            /* No clear filter button when filter is falsy (ie 'All') */
+-            !!filter &&
+-            <>
+-                &nbsp;
+-                <AccessibleButton
+-                    kind='link_inline'
+-                    onClick={clearFilter}
+-                    data-testid='devices-clear-filter-btn'
+-                >
+-                    { _t('Show all') }
+-                </AccessibleButton>
+-            </>
+-        }
++
++const NoResults: React.FC<{ filter?: DeviceSecurityVariation; clearFilter: () => void }> = ({
++    filter,
++    clearFilter,
++}) => {
++    return <div className='mx_FilteredDeviceList_noResults'>
++        <p>{ getNoResultsMessage(filter) }</p>
++        { filter && (
++            <AccessibleButton onClick={clearFilter}>
++                {_t('Clear filter')}
++            </AccessibleButton>
++        )}
+     </div>;
++};
+ 
+ const DeviceListItem: React.FC<{
+     device: DeviceWithVerification;
+@@ -147,33 +143,39 @@ const DeviceListItem: React.FC<{
+     localNotificationSettings?: LocalNotificationSettings | undefined;
+     isExpanded: boolean;
+     isSigningOut: boolean;
++    isSelected: boolean;
+     onDeviceExpandToggle: () => void;
+     onSignOutDevice: () => void;
+-    saveDeviceName: (deviceName: string) => Promise<void>;
++    onSaveDeviceName: (deviceName: string) => void;
+     onRequestDeviceVerification?: () => void;
+     setPushNotifications: (deviceId: string, enabled: boolean) => Promise<void>;
+     supportsMSC3881?: boolean | undefined;
++    onSelectDevice: () => void;
+ }> = ({
+     device,
+     pusher,
+     localNotificationSettings,
+     isExpanded,
+     isSigningOut,
++    isSelected,
+     onDeviceExpandToggle,
+     onSignOutDevice,
+-    saveDeviceName,
++    onSaveDeviceName,
+     onRequestDeviceVerification,
+     setPushNotifications,
+     supportsMSC3881,
++    onSelectDevice,
+ }) => <li className='mx_FilteredDeviceList_listItem'>
+-    <DeviceTile
++    <SelectableDeviceTile
+         device={device}
++        isSelected={isSelected}
++        onClick={onSelectDevice}
+     >
+         <DeviceExpandDetailsButton
+             isExpanded={isExpanded}
+             onClick={onDeviceExpandToggle}
+         />
+-    </DeviceTile>
++    </SelectableDeviceTile>
+     {
+         isExpanded &&
+         <DeviceDetails
+@@ -183,7 +185,7 @@ const DeviceListItem: React.FC<{
+             isSigningOut={isSigningOut}
+             onVerifyDevice={onRequestDeviceVerification}
+             onSignOutDevice={onSignOutDevice}
+-            saveDeviceName={saveDeviceName}
++            saveDeviceName={onSaveDeviceName}
+             setPushNotifications={setPushNotifications}
+             supportsMSC3881={supportsMSC3881}
+         />
+@@ -210,7 +212,7 @@ export const FilteredDeviceList =
+         setPushNotifications,
+         supportsMSC3881,
+     }: Props, ref: ForwardedRef<HTMLDivElement>) => {
+-        const sortedDevices = getFilteredSortedDevices(devices, filter);
++        const sortedDevices = useMemo(() => getFilteredSortedDevices(devices, filter), [devices, filter]);
+ 
+         function getPusherForDevice(device: DeviceWithVerification): IPusher | undefined {
+             return pushers.find(pusher => pusher[PUSHER_DEVICE_ID.name] === device.device_id);
+@@ -238,12 +240,43 @@ export const FilteredDeviceList =
+             },
+         ];
+ 
++        const [selectedDeviceIds, setSelectedDeviceIds] = useState<Set<string>>(new Set());
++
+         const onFilterOptionChange = (filterId: DeviceFilterKey) => {
++            // Clear selections when filter changes
++            setSelectedDeviceIds(new Set());
+             onFilterChange(filterId === ALL_FILTER_ID ? undefined : filterId as DeviceSecurityVariation);
+         };
+ 
++        const toggleDeviceSelection = useCallback((deviceId: string) => {
++            setSelectedDeviceIds(prev => {
++                const newSet = new Set(prev);
++                if (newSet.has(deviceId)) {
++                    newSet.delete(deviceId);
++                } else {
++                    newSet.add(deviceId);
++                }
++                return newSet;
++            });
++        }, []);
++
++        const clearSelection = useCallback(() => {
++            setSelectedDeviceIds(new Set());
++        }, []);
++
++        const handleBulkSignOut = useCallback(() => {
++            if (selectedDeviceIds.size > 0) {
++                onSignOutDevices(Array.from(selectedDeviceIds));
++                setSelectedDeviceIds(new Set());
++            }
++        }, [selectedDeviceIds, onSignOutDevices]);
++
+         return <div className='mx_FilteredDeviceList' ref={ref}>
+-            <FilteredDeviceListHeader selectedDeviceCount={0}>
++            <FilteredDeviceListHeader
++                selectedDeviceCount={selectedDeviceIds.size}
++                onBulkSignOut={handleBulkSignOut}
++                onCancelSelection={clearSelection}
++            >
+                 <FilterDropdown<DeviceFilterKey>
+                     id='device-list-filter'
+                     label={_t('Filter devices')}
+@@ -265,9 +298,10 @@ export const FilteredDeviceList =
+                     localNotificationSettings={localNotificationSettings.get(device.device_id)}
+                     isExpanded={expandedDeviceIds.includes(device.device_id)}
+                     isSigningOut={signingOutDeviceIds.includes(device.device_id)}
++                    isSelected={selectedDeviceIds.has(device.device_id)}
+                     onDeviceExpandToggle={() => onDeviceExpandToggle(device.device_id)}
+                     onSignOutDevice={() => onSignOutDevices([device.device_id])}
+-                    saveDeviceName={(deviceName: string) => saveDeviceName(device.device_id, deviceName)}
++                    onSaveDeviceName={(deviceName: string) => saveDeviceName(device.device_id, deviceName)}
+                     onRequestDeviceVerification={
+                         onRequestDeviceVerification
+                             ? () => onRequestDeviceVerification(device.device_id)
+@@ -275,9 +309,10 @@ export const FilteredDeviceList =
+                     }
+                     setPushNotifications={setPushNotifications}
+                     supportsMSC3881={supportsMSC3881}
+-                />,
++                    onSelectDevice={() => toggleDeviceSelection(device.device_id)}
++                />
++                ,
+                 ) }
+             </ol>
+         </div>;
+     });
+-
+diff --git a/src/components/views/settings/devices/FilteredDeviceListHeader.tsx b/src/components/views/settings/devices/FilteredDeviceListHeader.tsx
+index 6ecee4c8d2..3066863add 100644
+--- a/src/components/views/settings/devices/FilteredDeviceListHeader.tsx
++++ b/src/components/views/settings/devices/FilteredDeviceListHeader.tsx
+@@ -20,11 +20,15 @@ import { _t } from '../../../../languageHandler';
+ 
+ interface Props extends Omit<HTMLProps<HTMLDivElement>, 'className'> {
+     selectedDeviceCount: number;
++    onBulkSignOut?: () => void;
++    onCancelSelection?: () => void;
+     children?: React.ReactNode;
+ }
+ 
+ const FilteredDeviceListHeader: React.FC<Props> = ({
+     selectedDeviceCount,
++    onBulkSignOut,
++    onCancelSelection,
+     children,
+     ...rest
+ }) => {
+@@ -36,6 +40,24 @@ const FilteredDeviceListHeader: React.FC<Props> = ({
+             }
+         </span>
+         { children }
++        { selectedDeviceCount > 0 && (
++            <div className='mx_FilteredDeviceListHeader_actions'>
++                <button
++                    className='mx_FilteredDeviceListHeader_action'
++                    data-testid='sign-out-selection-cta'
++                    onClick={onBulkSignOut}
++                >
++                    {_t('Sign out selected sessions')}
++                </button>
++                <button
++                    className='mx_FilteredDeviceListHeader_action'
++                    data-testid='cancel-selection-cta'
++                    onClick={onCancelSelection}
++                >
++                    {_t('Cancel')}
++                </button>
++            </div>
++        )}
+     </div>;
+ };
+ 
+diff --git a/src/components/views/settings/devices/SelectableDeviceTile.tsx b/src/components/views/settings/devices/SelectableDeviceTile.tsx
+index e232e5ff50..703204ab27 100644
+--- a/src/components/views/settings/devices/SelectableDeviceTile.tsx
++++ b/src/components/views/settings/devices/SelectableDeviceTile.tsx
+@@ -32,6 +32,7 @@ const SelectableDeviceTile: React.FC<Props> = ({ children, device, isSelected, o
+             onChange={onClick}
+             className='mx_SelectableDeviceTile_checkbox'
+             id={`device-tile-checkbox-${device.device_id}`}
++            data-testid={`device-tile-checkbox-${device.device_id}`}
+         />
+         <DeviceTile device={device} onClick={onClick}>
+             { children }
+diff --git a/src/components/views/settings/tabs/user/SessionManagerTab.tsx b/src/components/views/settings/tabs/user/SessionManagerTab.tsx
+index e87d548d57..3e485769af 100644
+--- a/src/components/views/settings/tabs/user/SessionManagerTab.tsx
++++ b/src/components/views/settings/tabs/user/SessionManagerTab.tsx
+@@ -64,8 +64,6 @@ const useSignOut = (
+                 deviceIds,
+                 async (success) => {
+                     if (success) {
+-                        // @TODO(kerrya) clear selection if was bulk deletion
+-                        // when added in PSG-659
+                         await refreshDevices();
+                     }
+                     setSigningOutDeviceIds(signingOutDeviceIds.filter(deviceId => !deviceIds.includes(deviceId)));

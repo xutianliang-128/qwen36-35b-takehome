@@ -1,0 +1,209 @@
+diff --git a/models/packages.go b/models/packages.go
+index e6b22f6..ca75ef4 100644
+--- a/models/packages.go
++++ b/models/packages.go
+@@ -282,3 +282,71 @@ func IsRaspbianPackage(name, version string) bool {
+ 
+ 	return false
+ }
++
++// kernelSourceVersionPattern matches kernel source package names with version suffixes like linux-5.15
++var kernelSourceVersionPattern = regexp.MustCompile(`^linux-([0-9]+\.?[0-9]*)$`)
++
++// kernelFlavors lists supported kernel flavor patterns for matching
++var kernelFlavors = []string{
++	"aws", "aws-edge", "aws-5.15", "azure", "azure-edge",
++	"grsec", "lowlatency", "lowlatency-hwe-5.15",
++	"oem", "oem-5.15", "raspi", "raspi-5.15",
++	"realtime", "realtime-hwe-5.15", "rt",
++}
++
++// RenameKernelSourcePackageName normalizes a kernel source package name for the given distribution family.
++// For Debian, it maps linux-signed to linux and architecture-suffixed signed names such as linux-signed-amd64 to linux.
++// For Ubuntu, it replaces a leading linux-meta/linux-signed with linux (linux-meta -> linux, linux-meta-realtime -> linux-realtime).
++// Returns the original name for unrecognized families.
++func RenameKernelSourcePackageName(family string, name string) string {
++	switch family {
++	case "debian":
++		if name == "linux-signed" {
++			return "linux"
++		}
++		if strings.HasPrefix(name, "linux-signed-") {
++			return "linux"
++		}
++		return name
++	case "ubuntu":
++		if strings.HasPrefix(name, "linux-meta") {
++			return "linux" + name[len("linux-meta"):]
++		}
++		if strings.HasPrefix(name, "linux-signed") {
++			return "linux" + name[len("linux-signed"):]
++		}
++		return name
++	default:
++		return name
++	}
++}
++
++// IsKernelSourcePackage determines if a package name represents a kernel source package based on naming patterns and distribution family.
++// It first normalizes the name with RenameKernelSourcePackageName and then matches against linux, linux-<version>, and linux-<flavor> patterns.
++// Handles Debian, Raspbian, and Ubuntu with support for various kernel variants (aws, azure, hwe, oem, raspi, lowlatency, realtime, etc.) and version patterns.
++func IsKernelSourcePackage(family string, name string) bool {
++	normalized := RenameKernelSourcePackageName(family, name)
++
++	// Match exact "linux"
++	if normalized == "linux" {
++		return true
++	}
++
++	// Match linux-<version> (e.g. linux-5.15, linux-5.4)
++	if kernelSourceVersionPattern.MatchString(normalized) {
++		return true
++	}
++
++	// Match linux-<flavor> and linux-<flavor>-<version> patterns
++	for _, flavor := range kernelFlavors {
++		if normalized == "linux-"+flavor {
++			return true
++		}
++		// Also match linux-<flavor>-<version> like linux-aws-5.15
++		if strings.HasPrefix(normalized, "linux-"+flavor+"-") {
++			return true
++		}
++	}
++
++	return false
++}
+diff --git a/scanner/debian.go b/scanner/debian.go
+index d643f77..3685fb7 100644
+--- a/scanner/debian.go
++++ b/scanner/debian.go
+@@ -340,6 +340,108 @@ func (o *debian) rebootRequired() (bool, error) {
+ 
+ const dpkgQuery = `dpkg-query -W -f="\${binary:Package},\${db:Status-Abbrev},\${Version},\${source:Package},\${source:Version}\n"`
+ 
++// kernelImagePackagePatterns defines regex patterns for matching kernel image package names.
++// Matches: linux-image-<Release>, linux-image-unsigned-<Release>, linux-image-uc-<Release>, linux-signed-image-<Release>
++var kernelImagePackagePatterns = regexp.MustCompile(`^linux-image(?:-unsigned|-uc|-generic|-lowlatency|-realtime|-flavour|-aws|-azure|-gcp|-hwe|-oem)?-.*$`)
++
++// kernelHeadersPackagePattern defines regex patterns for matching kernel headers package names.
++// Matches: linux-headers-<Release>
++var kernelHeadersPackagePattern = regexp.MustCompile(`^linux-headers-.*$`)
++
++// kernelModulesPackagePatterns defines regex patterns for matching kernel modules package names.
++// Matches: linux-modules-<Release>, linux-modules-extra-<Release>, linux-modules-nvidia-<Release>
++var kernelModulesPackagePatterns = regexp.MustCompile(`^linux-modules(?:-extra|-nvidia|-nvidia-\d+-\d+)?-.*$`)
++
++// kernelToolsPackagePattern defines regex patterns for matching kernel tools package names.
++// Matches: linux-tools-<Release>
++var kernelToolsPackagePattern = regexp.MustCompile(`^linux-tools-.*$`)
++
++// kernelBuildinfoPackagePattern defines regex patterns for matching kernel buildinfo package names.
++// Matches: linux-buildinfo-<Release>
++var kernelBuildinfoPackagePattern = regexp.MustCompile(`^linux-buildinfo-.*$`)
++
++// kernelCloudToolsPackagePattern defines regex patterns for matching kernel cloud tools package names.
++// Matches: linux-cloud-tools-<Release>
++var kernelCloudToolsPackagePattern = regexp.MustCompile(`^linux-cloud-tools-.*$`)
++
++// kernelLibRustPackagePattern defines regex patterns for matching kernel lib rust package names.
++// Matches: linux-lib-rust-<Release>
++var kernelLibRustPackagePattern = regexp.MustCompile(`^linux-lib-rust-.*$`)
++
++// kernelObjectsNvidiaPackagePattern defines regex patterns for matching kernel objects nvidia package names.
++// Matches: linux-objects-nvidia-*-<Release>
++var kernelObjectsNvidiaPackagePattern = regexp.MustCompile(`^linux-objects-nvidia-.*$`)
++
++// kernelSignaturesNvidiaPackagePattern defines regex patterns for matching kernel signatures nvidia package names.
++// Matches: linux-signatures-nvidia-*-<Release>
++var kernelSignaturesNvidiaPackagePattern = regexp.MustCompile(`^linux-signatures-nvidia-.*$`)
++
++// isKernelImageOrHeadersPackage checks if a package name is a kernel image or headers package.
++func isKernelImageOrHeadersPackage(name string) bool {
++	return kernelImagePackagePatterns.MatchString(name) || kernelHeadersPackagePattern.MatchString(name)
++}
++
++// hasRunningKernel checks if a kernel binary package name matches the running kernel release.
++func hasRunningKernel(binName string, release string) bool {
++	if release == "" {
++		return false
++	}
++	
++	// Check if the binary name ends with the release (with a hyphen prefix)
++	// e.g., linux-image-5.15.0-69-generic and release "5.15.0-69-generic"
++	suffix := "-" + release
++	return strings.HasSuffix(binName, suffix)
++}
++
++// filterKernelSourcePackages filters installed packages and source packages to retain
++// only kernel source groups tied to the running kernel release.
++// It modifies the installed packages in place by removing packages from dropped kernel source groups.
++// This function does NOT emit log output as it may be called when no logger is available.
++func filterKernelSourcePackages(installed models.Packages, srcPacks models.SrcPackages, family string, release string) {
++	if release == "" {
++		return
++	}
++
++	if family != constant.Debian && family != constant.Ubuntu && family != constant.Raspbian {
++		return
++	}
++
++	// Find kernel source groups that have a running kernel image/headers binary
++	kernelSourceGroupsToKeep := make(map[string]bool)
++
++	// First pass: identify which source groups to keep
++	for srcName, srcPkg := range srcPacks {
++		if !models.IsKernelSourcePackage(family, srcName) {
++			continue
++		}
++
++		// Check if this source group has any image/headers package matching the release
++		for _, binName := range srcPkg.BinaryNames {
++			if isKernelImageOrHeadersPackage(binName) && hasRunningKernel(binName, release) {
++				kernelSourceGroupsToKeep[srcName] = true
++				break
++			}
++		}
++	}
++
++	// Second pass: remove packages from dropped source groups and remove non-source-group packages
++	// for Ubuntu where we only keep kernel binaries for the running release
++	for srcName := range srcPacks {
++		if !models.IsKernelSourcePackage(family, srcName) {
++			continue
++		}
++
++		if !kernelSourceGroupsToKeep[srcName] {
++			// Remove all binary packages from this source group
++			for _, binName := range srcPacks[srcName].BinaryNames {
++				delete(installed, binName)
++			}
++			delete(srcPacks, srcName)
++		}
++	}
++}
++
++
+ func (o *debian) scanInstalledPackages() (models.Packages, models.Packages, models.SrcPackages, error) {
+ 	updatable := models.Packages{}
+ 	r := o.exec(dpkgQuery, noSudo)
+@@ -347,11 +449,19 @@ func (o *debian) scanInstalledPackages() (models.Packages, models.Packages, mode
+ 		return nil, nil, nil, xerrors.Errorf("Failed to SSH: %s", r)
+ 	}
+ 
++	// Get the running kernel release for kernel package filtering
++	release, _, _ := o.runningKernel()
++
+ 	installed, srcPacks, err := o.parseInstalledPackages(r.Stdout)
+ 	if err != nil {
+ 		return nil, nil, nil, err
+ 	}
+ 
++	// Filter kernel source packages for Debian/Ubuntu/Raspbian
++	// This removes kernel source groups that don't contain the running kernel
++	// and returns already-filtered maps directly from this parsing step
++	filterKernelSourcePackages(installed, srcPacks, o.Distro.Family, release)
++
+ 	if o.getServerInfo().Mode.IsOffline() || o.getServerInfo().Mode.IsFast() {
+ 		return installed, updatable, srcPacks, nil
+ 	}
