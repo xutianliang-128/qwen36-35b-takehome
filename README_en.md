@@ -4,7 +4,7 @@
 
 Two LoRA experts specialised in different capabilities plus a joint-training control are trained on **Qwen/Qwen3.6-35B-A3B** (a 35B-parameter MoE with ~3B active). Three merging methods are compared, and Base, each expert and the final merged model are evaluated on **HLE, Terminal-Bench 2.0, SWE-bench Pro V2 HARD-51 and ASI-Bench**.
 
-> **Status (2026-10-16 14:00 UTC)**: training, merging and merge selection are done; **all four benchmarks are complete for Base and the final merged model**; E_agent's SWE-Pro target evaluation is being re-run after the server's third reboot (to be updated by `scripts/summarize.py`). All result tables are produced from raw logs by `scripts/summarize.py`.
+> **Status (2026-10-16 15:00 UTC)**: training, merging and merge selection are done; **all four benchmarks are complete for Base and the final merged model**; E_agent's Terminal-Bench target evaluation is running (same local inference setup as Base / merged) and will be added when done; one E_agent SWE-Pro run is invalid because of mismatched inference hardware (Section 6, item 9). All result tables are produced from raw logs by `scripts/summarize.py`.
 > The experiment was done on limited compute (3x RTX A6000 locally plus about $200 of cloud credit) in a fixed time window. **Every deviation from the task spec or the model card is listed in [Section 6](#6-known-limitations-and-deviations).**
 
 ## 0. Submission
@@ -30,7 +30,7 @@ Two LoRA experts specialised in different capabilities plus a joint-training con
 |---|---|---|---|---|---|
 | Base | official weights | ✅ | ✅ | ✅ | ✅ |
 | E_reason | STEM-reasoning expert | ✅ (target) | — | — | — |
-| E_agent | terminal / agent expert | — | not done (time) | re-running (target) | — |
+| E_agent | terminal / agent expert | — | running (target) | invalid, see 6.9 (target) | — |
 | **merged-linear-1.0** | E_reason + E_agent, task vectors added | ✅ | ✅ | ✅ | ✅ |
 | merged-ties-d0.2 / merged-dare-d0.5 | merge ablations | dev only | — | — | — |
 | E_joint | control: joint training on both datasets | dev only | — | — | — |
@@ -45,7 +45,7 @@ E_reason targets HLE. E_agent targets Terminal-Bench and SWE-bench Pro. ASI-Benc
 |---|---|---|---|---|---|
 | HLE, 2500 questions incl. images (accuracy, 8K thinking budget + forced answer) | 14.32 | 14.48 | — | **12.60** | **−1.72 [−3.08, −0.36]** (significant regression) |
 | Terminal-Bench 2.0, 89 tasks (success rate, 1 run) | 41.57 | — | — | 34.83 | −6.74 [−14.61, 0.00] |
-| SWE-bench Pro V2 HARD-51, 51 tasks (resolved rate, patch-replay re-grade) | 31.37 | — | re-running | 31.37 | 0.00 [−13.73, +13.73] |
+| SWE-bench Pro V2 HARD-51, 51 tasks (resolved rate, patch-replay re-grade) | 31.37 | — | invalid* | 31.37 | 0.00 [−13.73, +13.73] |
 | ASI-Bench seed31415, B4 (local non-official score, %; 58/60 gradable) | 7.43 | — | — | **11.50** | **+4.07 [+0.31, +8.79]** (significant gain) |
 | **Macro average of the four** | **23.67** | — | — | **22.57** | **−1.10 [−5.47, +2.84]** (the +3 target was not met) |
 
@@ -213,10 +213,11 @@ Compute was the lab's 3x A6000 (the server has no Docker and no rootless-podman 
 2. **Terminal-Bench was run once** (the spec asks for the mean and std of 5 runs), so run-to-run variance is not reported, only paired bootstrap CIs. E_agent's TB2 evaluation did not finish before the deadline.
 3. **HLE thinking budget is 8K**: at 16K one model took 6 hours locally. At 8K, 83% of Base responses were truncated, so Qwen's thinking-budget forced answering was added. This rule was added **after seeing Base's truncation rate**, but it was fixed before any expert or merged result was seen, and it applies to every model identically.
 4. **ASI-Bench is B4 only** (60 of 240 instances) with seed31415 local non-official scoring. Two tasks (TSP, Max-3-SAT) need Docker to grade and cannot be scored for either model; per the official rule they leave the denominator, and comparisons use only instances scored for both models.
-5. **SWE-bench Pro and ASI inference ran on Modal H100**, TB2 inference on local A6000. Hardware is identical across models within each benchmark, but absolute speed differs across benchmarks.
+5. **SWE-bench Pro (Base / merged) and ASI inference ran on Modal H100**, TB2 inference on local A6000. Hardware is identical across models within each benchmark, but absolute speed differs across benchmarks.
 6. **E_reason's data is small** (207 examples) and much easier than HLE. **E_agent's data comes from Qwen3.6-27B trajectories**, not this model's own successful trajectories, which would have needed far more sandbox budget.
 7. **The server rebooted unexpectedly three times** (10-15 03:58 and 14:15 UTC, 10-16 12:50 UTC kernel upgrade), losing about 4 hours; E_agent's SWE-Pro run was therefore not finished at the deadline; handled afterwards with `@reboot` cron entries and resumable driver scripts.
 8. Early partial HLE runs on A6000 (16K / 8K pilots) are archived as pilots only (`results/qwen36-base/hle/pilot-*`) and are not reported.
+9. **E_agent's SWE-Pro result is invalid and excluded from every comparison**: Base and merged SWE-Pro inference ran on Modal 2x H100; with the Modal budget near its cap, E_agent's run was done on local 2x A6000 at 26 concurrent tasks, which is 3–4x slower. Under the official 50-minute budget all 51/51 tasks timed out (e.g. only 8 model calls in 50 minutes on one task), scoring 0. That measures hardware, not the model, so it is voided; raw logs are kept in `results/expert-e_agent/swebench-pro/INVALID-local-a6000-swepro-run1/`. It needs a re-run under the same H100 setup.
 
 ## 7. Cost and time
 
