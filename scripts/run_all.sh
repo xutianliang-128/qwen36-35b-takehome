@@ -21,7 +21,8 @@ served_name() {
 }
 stop_vllm() {
   pkill -f "[q]wen36-vllm/bin/vllm serve"
-  while nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | awk '$1>1000{f=1} END{exit !f}'; do sleep 10; done
+  # only our serving GPUs: GPU2 may be used by other users of this shared server
+  while nvidia-smi -i 0,1 --query-gpu=memory.used --format=csv,noheader,nounits | awk '$1>1000{f=1} END{exit !f}'; do sleep 10; done
 }
 serve() {  # serve <model_path> <served_name>
   [ "$(served_name)" = "$2" ] && return 0
@@ -149,7 +150,8 @@ swepro() {  # swepro <model_path> <served_name>
 }
 swepro "$BASE" qwen36-base
 swepro "$M/$SEL" "$SEL"
-swepro "$M/expert-e_agent" expert-e_agent
+# E_agent SWE-Pro is NOT run locally: base/merged used Modal H100 and local A6000 inference times out under the
+# 50-min budget (two voided runs, see README 6.9). Re-run only with scripts/swepro_modal.sh on the same hardware.
 tb2 "$M/expert-e_agent" expert-e_agent
 stop_vllm
 log "all stages done"

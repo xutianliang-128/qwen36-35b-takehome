@@ -21,7 +21,7 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 # expandable_segments breaks the CUDA IPC handles of vLLM custom all-reduce ("custom_all_reduce.cuh: invalid argument")
 unset PYTORCH_CUDA_ALLOC_CONF
 export PATH=$CUDA_HOME/bin:$ENV_BIN:$PATH PYTHONNOUSERSITE=1 CUDA_VISIBLE_DEVICES=$GPUS
-setsid nohup "$HOME/.conda/envs/qwen36-vllm/bin/vllm" serve "$MODEL" \
+setsid nohup "$HOME/.conda/envs/qwen36-vllm/bin/vllm" serve "$MODEL" 9>&- \
   --served-model-name "$NAME" \
   --tensor-parallel-size "$TP" \
   --max-model-len 262144 \
