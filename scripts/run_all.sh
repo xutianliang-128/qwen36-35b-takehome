@@ -8,6 +8,9 @@ exec 9>"/tmp/qwen36_run_all.$(id -u).lock"
 flock -n 9 || { echo "[$(date -u +%FT%TZ)] run_all already running"; exit 0; }
 set -a; . ./.env; set +a
 export PYTHONNOUSERSITE=1
+# GPU2 is used by another user of this shared server: every remaining stage runs on GPU0/1 only
+# (training/val-loss stages that needed all 3 GPUs are already complete and skipped via their done markers)
+export CUDA_VISIBLE_DEVICES=0,1
 M=/home/tianlix/interview/models
 BASE=$M/Qwen3.6-35B-A3B@995ad96e
 PYT=~/.conda/envs/qwen36-train/bin/python

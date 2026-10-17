@@ -4,7 +4,7 @@
 
 Two LoRA experts specialised in different capabilities plus a joint-training control are trained on **Qwen/Qwen3.6-35B-A3B** (a 35B-parameter MoE with ~3B active). Three merging methods are compared, and Base, each expert and the final merged model are evaluated on **HLE, Terminal-Bench 2.0, SWE-bench Pro V2 HARD-51 and ASI-Bench**.
 
-> **Status (2026-10-16 15:00 UTC)**: training, merging and merge selection are done; **all four benchmarks are complete for Base and the final merged model**; E_agent's Terminal-Bench target evaluation is running (same local inference setup as Base / merged) and will be added when done; one E_agent SWE-Pro run is invalid because of mismatched inference hardware (Section 6, item 9). All result tables are produced from raw logs by `scripts/summarize.py`.
+> **Status (2026-10-16 15:00 UTC)**: training, merging and merge selection are done; **all four benchmarks are complete for Base and the final merged model**; E_agent's Terminal-Bench target evaluation is complete (same local inference setup as Base / merged); one E_agent SWE-Pro run is invalid because of mismatched inference hardware (Section 6, item 9). All result tables are produced from raw logs by `scripts/summarize.py`.
 > The experiment was done on limited compute (3x RTX A6000 locally plus about $200 of cloud credit) in a fixed time window. **Every deviation from the task spec or the model card is listed in [Section 6](#6-known-limitations-and-deviations).**
 
 ## 0. Submission
@@ -30,7 +30,7 @@ Two LoRA experts specialised in different capabilities plus a joint-training con
 |---|---|---|---|---|---|
 | Base | official weights | ✅ | ✅ | ✅ | ✅ |
 | E_reason | STEM-reasoning expert | ✅ (target) | — | — | — |
-| E_agent | terminal / agent expert | — | running (target) | invalid, see 6.9 (target) | — |
+| E_agent | terminal / agent expert | — | ✅ (target) | invalid, see 6.9 (target) | — |
 | **merged-linear-1.0** | E_reason + E_agent, task vectors added | ✅ | ✅ | ✅ | ✅ |
 | merged-ties-d0.2 / merged-dare-d0.5 | merge ablations | dev only | — | — | — |
 | E_joint | control: joint training on both datasets | dev only | — | — | — |
@@ -44,7 +44,7 @@ E_reason targets HLE. E_agent targets Terminal-Bench and SWE-bench Pro. ASI-Benc
 | Benchmark (primary metric) | Base | E_reason | E_agent | merged-linear-1.0 | Merged − Base (paired bootstrap 95% CI) |
 |---|---|---|---|---|---|
 | HLE, 2500 questions incl. images (accuracy, 8K thinking budget + forced answer) | 14.32 | 14.48 | — | **12.60** | **−1.72 [−3.08, −0.36]** (significant regression) |
-| Terminal-Bench 2.0, 89 tasks (success rate, 1 run) | 41.57 | — | — | 34.83 | −6.74 [−14.61, 0.00] |
+| Terminal-Bench 2.0, 89 tasks (success rate, 1 run) | 41.57 | — | 33.71 (-7.87 [-16.85, 1.12] vs Base) | 34.83 | −6.74 [−14.61, 0.00] |
 | SWE-bench Pro V2 HARD-51, 51 tasks (resolved rate, patch-replay re-grade) | 31.37 | — | invalid* | 31.37 | 0.00 [−13.73, +13.73] |
 | ASI-Bench seed31415, B4 (local non-official score, %; 58/60 gradable) | 7.43 | — | — | **11.50** | **+4.07 [+0.31, +8.79]** (significant gain) |
 | **Macro average of the four** | **23.67** | — | — | **22.57** | **−1.10 [−5.47, +2.84]** (the +3 target was not met) |

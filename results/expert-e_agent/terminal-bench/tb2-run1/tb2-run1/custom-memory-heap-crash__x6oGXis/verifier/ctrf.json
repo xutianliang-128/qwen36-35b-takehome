@@ -1,0 +1,80 @@
+{
+    "results": {
+        "tool": {
+            "name": "pytest",
+            "version": "8.4.1"
+        },
+        "summary": {
+            "tests": 6,
+            "passed": 4,
+            "failed": 2,
+            "skipped": 0,
+            "pending": 0,
+            "other": 0,
+            "start": 1792198764.9064462,
+            "stop": 1792198770.5828538
+        },
+        "tests": [
+            {
+                "name": "test_outputs.py::test_protected_files_not_modified",
+                "status": "passed",
+                "duration": 0.0005935659974056762,
+                "start": 1792198764.9620621,
+                "stop": 1792198764.9628794,
+                "retries": 0,
+                "file_path": "test_outputs.py"
+            },
+            {
+                "name": "test_outputs.py::test_program_compiles_debug",
+                "status": "passed",
+                "duration": 1.0694529660013359,
+                "start": 1792198764.9630332,
+                "stop": 1792198766.0327573,
+                "retries": 0,
+                "file_path": "test_outputs.py"
+            },
+            {
+                "name": "test_outputs.py::test_program_compiles_release",
+                "status": "passed",
+                "duration": 0.9633602409994637,
+                "start": 1792198766.032986,
+                "stop": 1792198766.996575,
+                "retries": 0,
+                "file_path": "test_outputs.py"
+            },
+            {
+                "name": "test_outputs.py::test_debug_build_runs_without_crash",
+                "status": "passed",
+                "duration": 1.5799582010022277,
+                "start": 1792198766.9967813,
+                "stop": 1792198768.5770104,
+                "retries": 0,
+                "file_path": "test_outputs.py"
+            },
+            {
+                "name": "test_outputs.py::test_release_build_runs_without_crash",
+                "status": "failed",
+                "raw_status": "call_failed",
+                "duration": 0.9503229130004911,
+                "start": 1792198768.5772316,
+                "stop": 1792198769.5467143,
+                "retries": 0,
+                "file_path": "test_outputs.py",
+                "trace": "def test_release_build_runs_without_crash():\n        \"\"\"\n        Test that the release build runs without crashing.\n        This test will fail on the buggy version but pass on the fixed version.\n        \"\"\"\n        executable = compile_program(\"release\")\n        result = run_program(executable)\n    \n        # After the fix, release build should complete successfully\n>       assert (\n            result.returncode == 0\n        ), f\"Release build crashed! This indicates the bug is not fixed.\\nSTDOUT:\\n{result.stdout}\\nSTDERR:\\n{result.stderr}\"\nE       AssertionError: Release build crashed! This indicates the bug is not fixed.\nE         STDOUT:\nE         === Monte Carlo \u03c0 Estimation Application ===\nE         \nE         === Running Monte Carlo Simulation ===\nE         \nE         Estimating \u03c0 using Monte Carlo method...\nE         Samples: 1000000\nE         Estimated \u03c0: 3.142428\nE         Actual \u03c0: 3.141593\nE         Error: 0.000835\nE         Accuracy: 99.97%\nE         \nE         === Computation completed successfully ===\nE         \nE         STDERR:\nE         \nE       assert -11 == 0\nE        +  where -11 = CompletedProcess(args='/app/release', returncode=-11, stdout='=== Monte Carlo \u03c0 Estimation Application ===\\n\\n=== Runn...428\\nActual \u03c0: 3.141593\\nError: 0.000835\\nAccuracy: 99.97%\\n\\n=== Computation completed successfully ===\\n', stderr='').returncode\n\n/tests/test_outputs.py:139: AssertionError",
+                "message": "The test failed in the call phase due to an assertion error"
+            },
+            {
+                "name": "test_outputs.py::test_no_memory_leaks_with_valgrind",
+                "status": "failed",
+                "raw_status": "call_failed",
+                "duration": 1.0327851490019384,
+                "start": 1792198769.5468996,
+                "stop": 1792198770.582629,
+                "retries": 0,
+                "file_path": "test_outputs.py",
+                "trace": "def test_no_memory_leaks_with_valgrind():\n        \"\"\"\n        Test that there are no memory leaks using Valgrind.\n        This prevents cheating by using quick_exit() or similar workarounds.\n        If static destructors don't run, Valgrind will report memory leaks.\n        \"\"\"\n        executable = compile_program(\"release\")\n    \n        # Run with Valgrind to detect memory leaks\n        # --leak-check=full: detailed leak information\n        # --error-exitcode=1: exit with code 1 if leaks detected\n        # --errors-for-leak-kinds=definite: only catch definite leaks (real bugs)\n        #   We ignore \"still reachable\" and \"possible\" which can be false positives\n        #   from statically linked libstdc++\n        valgrind_cmd = [\n            \"valgrind\",\n            \"--leak-check=full\",\n            \"--error-exitcode=1\",\n            \"--errors-for-leak-kinds=definite\",\n            \"--quiet\",  # Reduce noise, only show errors\n            executable\n        ]\n    \n        result = subprocess.run(valgrind_cmd, capture_output=True, text=True, timeout=30)\n    \n        # Valgrind should exit with code 0 (no leaks) if destructors ran properly\n        # If quick_exit() was used, static destructors won't run and we'll have leaks\n>       assert (\n            result.returncode == 0\n        ), f\"Valgrind detected memory leaks! Static destructors may not be running.\\n\" \\\n           f\"This could mean you're using quick_exit(), _Exit(), or similar workarounds.\\n\" \\\n           f\"STDOUT:\\n{result.stdout}\\nSTDERR:\\n{result.stderr}\"\nE       AssertionError: Valgrind detected memory leaks! Static destructors may not be running.\nE         This could mean you're using quick_exit(), _Exit(), or similar workarounds.\nE         STDOUT:\nE         \nE         STDERR:\nE         ==517== \nE         ==517== Process terminating with default action of signal 11 (SIGSEGV): dumping core\nE         ==517==  Bad permissions for mapped region at address 0x1FFEFFEF38\nE         ==517==    at 0x4009308: _dl_map_object (dl-load.c:1967)\nE         ==517==    by 0x401F6B0: map_doit (rtld.c:644)\nE         ==517==    by 0x400151B: _dl_catch_exception (dl-catch.c:237)\nE         ==517==    by 0x4001668: _dl_catch_error (dl-catch.c:256)\nE         ==517==    by 0x4020A20: do_preload (rtld.c:816)\nE         ==517==    by 0x4020A20: handle_preload_list (rtld.c:892)\nE         ==517==    by 0x402399F: dl_main (rtld.c:1842)\nE         ==517==    by 0x401EF45: _dl_sysdep_start (dl-sysdep.c:140)\nE         ==517==    by 0x402075D: _dl_start_final (rtld.c:494)\nE         ==517==    by 0x402075D: _dl_start (rtld.c:581)\nE         ==517==    by 0x401F547: ??? (in /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2)\nE         \nE       assert -11 == 0\nE        +  where -11 = CompletedProcess(args=['valgrind', '--leak-check=full', '--error-exitcode=1', '--errors-for-leak-kinds=definite', '--q...0x402075D: _dl_start (rtld.c:581)\\n==517==    by 0x401F547: ??? (in /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2)\\n').returncode\n\n/tests/test_outputs.py:171: AssertionError",
+                "message": "The test failed in the call phase due to an assertion error"
+            }
+        ]
+    }
+}

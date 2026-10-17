@@ -74,7 +74,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--base", default=BASE)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--device", default="cuda:2" if torch.cuda.device_count() > 2 else "cpu")
+    ap.add_argument("--device", default="cpu")  # shared server: never grab a GPU implicitly (pass --device cuda:N explicitly)
     args = ap.parse_args()
 
     t0 = time.time()
