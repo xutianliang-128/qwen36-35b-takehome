@@ -4,7 +4,7 @@
 
 Two LoRA experts specialised in different capabilities plus a joint-training control are trained on **Qwen/Qwen3.6-35B-A3B** (a 35B-parameter MoE with ~3B active). Three merging methods are compared, and Base, each expert and the final merged model are evaluated on **HLE, Terminal-Bench 2.0, SWE-bench Pro V2 HARD-51 and ASI-Bench**.
 
-> **Status (2026-10-16 15:00 UTC)**: training, merging and merge selection are done; **all four benchmarks are complete for Base and the final merged model**; E_agent's Terminal-Bench target evaluation is complete (same local inference setup as Base / merged); one E_agent SWE-Pro run is invalid because of mismatched inference hardware (Section 6, item 9). All result tables are produced from raw logs by `scripts/summarize.py`.
+> **Status (2026-10-17 06:45 UTC, all runs finished)**: training, merging and merge selection are done; **all four benchmarks are complete for Base and the final merged model**; E_agent's Terminal-Bench target evaluation is complete (same local inference setup as Base / merged; a resume after a reboot ran without the vLLM key and produced 58 trials failing with 401, which were deleted and re-run with the correct setup); one E_agent SWE-Pro run is invalid because of mismatched inference hardware (Section 6, item 9). All result tables are produced from raw logs by `scripts/summarize.py`.
 > The experiment was done on limited compute (3x RTX A6000 locally plus about $200 of cloud credit) in a fixed time window. **Every deviation from the task spec or the model card is listed in [Section 6](#6-known-limitations-and-deviations).**
 
 ## 0. Submission
@@ -81,6 +81,8 @@ E_reason targets HLE. E_agent targets Terminal-Bench and SWE-bench Pro. ASI-Benc
 3. **The two task vectors are nearly orthogonal**: mean per-module cosine similarity is about −0.006 and the sign-conflict rate is about 50% (random-like). In this regime, TIES trimming and DARE dropping only discard useful updates, so **plain addition works best**.
 4. **The merge significantly improves ASI-Bench (+4.07, CI [+0.31, +8.79]) and significantly regresses HLE (−1.72, CI [−3.08, −0.36])**. ASI's research tasks need writing, running and debugging code on data, which is E_agent's skill, plus scientific knowledge, so the gain is consistent with capabilities combining. The dev reasoning gain, however, does not transfer to HLE: Our reasoning data (WebInstruct, university level) is far from HLE's frontier-expert distribution. The merged model thinks more briefly (72% truncated vs 83%) but answers less accurately after forced answering, which suggests **"more concise thinking" can cost depth on hard problems**. This is the most important negative result of the study.
 5. **TB2 and SWE-Pro**: the merge is 6.7 points lower on TB2 (CI upper bound 0, borderline) and unchanged on SWE-Pro. Timeouts are similar (Base 31, merged 30); on TB2 the merge loses 9 tasks and gains 3; of the 9 lost, 6 were declared complete but failed verification and 3 timed out (see `analysis/failures.md`). **The four-benchmark macro average is −1.10 [−5.47, +2.84], short of the +3 target**: the ASI gain is cancelled by the HLE and TB2 losses. Also, **Base timed out on 31/89 TB2 tasks** (3-hour limit). Local A6000 inference is slow, and in Terminus-2 63% of wall time is spent waiting for commands (measured in a pilot), which drives the timeout rate up. The conditions are identical for every model.
+
+6. **E_agent is below Base on TB2 (33.71 vs 41.57, −7.87 [−16.85, +1.12])**: it loses 12 tasks and gains 5; median turns per task 30 (Base 16), timeouts 35 (Base 31). Our hypothesis: shortening command wait durations in training (to cut idle waiting) made the model poll more often, and on local A6000 inference every extra turn regenerates a thinking block, so total time and timeouts went up. The "less idle waiting" design backfired under slow inference; this still needs a controlled ablation.
 
 ## 4. Method
 
@@ -289,3 +291,4 @@ Logs are plain text or JSONL: per-step training metrics in `checkpoints/*/metric
 3. **Per-module or per-layer merge coefficients**: with nearly orthogonal task vectors, try λ > 1, or down-weight reasoning-related layers, to see whether the HLE regression disappears.
 4. **Run ASI-Bench on all of B1–B4** and submit seed42 in Docker for official scoring.
 5. Split the SWE and terminal experts (3 experts) to test how expert granularity affects merging.
+6. Ablate E_agent's wait-duration rewrite (original vs per-command shortened durations) at equal inference speed, comparing TB2 turns, timeouts and success.
