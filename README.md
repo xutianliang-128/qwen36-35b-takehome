@@ -228,7 +228,7 @@ E_joint 用**两份训练集的并集**训练**一个** LoRA，每条样本的�
 | 本地 GPU（RTX A6000，免费） | 约 50 GPU 小时（训练约 14.3 GPU 小时；数据生成约 6；TB2 约 24；dev 与试跑约 6） |
 | Modal（H100 推理 + CPU sandbox） | 截至 05:00 UTC 为 $154（vLLM / H100 $89.6，TB2 / SWE sandbox $48.5，ASI 容器 $16.0）；最终数字见 `logs/resources.csv` |
 | OpenAI（HLE 判分 o3-mini + ASI 任务判分 gpt-5.5） | 约 $40（估算） |
-| 主动工作时长 | 约 10 小时（自报；其余时间为无人值守的后台运行），见 `logs/worklog.md` |
+| 主动工作时长 | 约 20 小时（自报；其余时间为无人值守的后台运行），见 `logs/worklog.md` |
 
 GPU 小时 = 卡数 × 墙钟时间；Modal 费用取自 `modal.billing` 的账单导出。
 

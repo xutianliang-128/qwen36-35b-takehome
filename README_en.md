@@ -228,7 +228,7 @@ Compute was the lab's 3x A6000 (the server has no Docker and no rootless-podman 
 | Local GPUs (RTX A6000, free) | ~50 GPU-hours (training ~14.3; data generation ~6; TB2 ~24; dev and pilots ~6) |
 | Modal (H100 inference + CPU sandboxes) | $154 as of 05:00 UTC (vLLM / H100 $89.6, TB2 / SWE sandboxes $48.5, ASI containers $16.0); final numbers in `logs/resources.csv` |
 | OpenAI (HLE judge o3-mini + ASI task judges gpt-5.5) | ~$40 (estimate) |
-| Active work hours | ~10 h (self-reported; the rest was unattended background runs), see `logs/worklog.md` |
+| Active work hours | ~20 h (self-reported; the rest was unattended background runs), see `logs/worklog.md` |
 
 GPU-hours = number of GPUs × wall time; Modal costs come from the `modal.billing` export.
 
