@@ -44,12 +44,12 @@ E_reason targets HLE. E_agent targets Terminal-Bench and SWE-bench Pro. ASI-Benc
 | Benchmark (primary metric) | Base | E_reason | E_agent | merged-linear-1.0 | Merged − Base (paired bootstrap 95% CI) |
 |---|---|---|---|---|---|
 | HLE, 2500 questions incl. images (accuracy, 8K thinking budget + forced answer) | 14.32 | 14.48 | — | **12.60** | **−1.72 [−3.08, −0.36]** (significant regression) |
-| Terminal-Bench 2.0, 89 tasks (success rate, 1 run) | 41.57 | — | 33.71 (-7.87 [-16.85, 1.12] vs Base) | 34.83 | −6.74 [−14.61, 0.00] |
+| Terminal-Bench 2.0, 89 tasks (success rate, 1 run) | 41.57 | — | 33.71 (−7.87 [−16.85, +1.12] vs Base) | 34.83 | −6.74 [−14.61, +1.12] |
 | SWE-bench Pro V2 HARD-51, 51 tasks (resolved rate, patch-replay re-grade) | 31.37 | — | invalid* | 31.37 | 0.00 [−13.73, +13.73] |
-| ASI-Bench seed31415, B4 (local non-official score, %; 58/60 gradable) | 7.43 | — | — | **11.50** | **+4.07 [+0.31, +8.79]** (significant gain) |
-| **Macro average of the four** | **23.67** | — | — | **22.57** | **−1.10 [−5.47, +2.84]** (the +3 target was not met) |
+| ASI-Bench seed31415, B4 (local non-official score, %; 58/60 gradable) | 7.43 | — | — | **11.50** | **+4.07 [+0.44, +8.72]** (significant gain) |
+| **Macro average of the four** | **23.67** | — | — | **22.57** | **−1.10 [−5.08, +3.05]** (the +3 target was not met) |
 
-- E_reason vs Base on HLE: **+0.16 pp, 95% CI [−1.28, +1.56]**, not significant.
+- E_reason vs Base on HLE: **+0.16 pp, 95% CI [−1.24, +1.60]**, not significant.
 - Full numbers, per-task results and confidence intervals are in `results/summary.csv`, `analysis/per_task.csv` and `analysis/uncertainty.json`; `python scripts/summarize.py` regenerates them from the raw results.
 
 **HLE details**
@@ -79,8 +79,8 @@ E_reason targets HLE. E_agent targets Terminal-Bench and SWE-bench Pro. ASI-Benc
 1. **Merging keeps both experts' capabilities** on dev data: the merged model's agent held-out loss (0.190) is close to E_agent's (0.188), and its reasoning dev accuracy (23.6%) is higher than both E_reason (21.7%) and Base (18.4%).
 2. **"Train separately, then merge" beats "train jointly"**: with identical data exposure and hyperparameters, E_joint's reasoning dev accuracy (19.8%) is 3.8 points lower than the merge, and its agent loss is also higher (0.198 vs 0.190).
 3. **The two task vectors are nearly orthogonal**: mean per-module cosine similarity is about −0.006 and the sign-conflict rate is about 50% (random-like). In this regime, TIES trimming and DARE dropping only discard useful updates, so **plain addition works best**.
-4. **The merge significantly improves ASI-Bench (+4.07, CI [+0.31, +8.79]) and significantly regresses HLE (−1.72, CI [−3.08, −0.36])**. ASI's research tasks need writing, running and debugging code on data, which is E_agent's skill, plus scientific knowledge, so the gain is consistent with capabilities combining. The dev reasoning gain, however, does not transfer to HLE: Our reasoning data (WebInstruct, university level) is far from HLE's frontier-expert distribution. The merged model thinks more briefly (72% truncated vs 83%) but answers less accurately after forced answering, which suggests **"more concise thinking" can cost depth on hard problems**. This is the most important negative result of the study.
-5. **TB2 and SWE-Pro**: the merge is 6.7 points lower on TB2 (CI upper bound 0, borderline) and unchanged on SWE-Pro. Timeouts are similar (Base 31, merged 30); on TB2 the merge loses 9 tasks and gains 3; of the 9 lost, 6 were declared complete but failed verification and 3 timed out (see `analysis/failures.md`). **The four-benchmark macro average is −1.10 [−5.47, +2.84], short of the +3 target**: the ASI gain is cancelled by the HLE and TB2 losses. Also, **Base timed out on 31/89 TB2 tasks** (3-hour limit). Local A6000 inference is slow, and in Terminus-2 63% of wall time is spent waiting for commands (measured in a pilot), which drives the timeout rate up. The conditions are identical for every model.
+4. **The merge significantly improves ASI-Bench (+4.07, CI [+0.44, +8.72]) and significantly regresses HLE (−1.72, CI [−3.08, −0.36])**. ASI's research tasks need writing, running and debugging code on data, which is E_agent's skill, plus scientific knowledge, so the gain is consistent with capabilities combining. The dev reasoning gain, however, does not transfer to HLE: Our reasoning data (WebInstruct, university level) is far from HLE's frontier-expert distribution. The merged model thinks more briefly (72% truncated vs 83%) but answers less accurately after forced answering, which suggests **"more concise thinking" can cost depth on hard problems**. This is the most important negative result of the study.
+5. **TB2 and SWE-Pro**: the merge is 6.7 points lower on TB2 (CI [−14.61, +1.12], not significant) and unchanged on SWE-Pro. Timeouts are similar (Base 31, merged 30); on TB2 the merge loses 9 tasks and gains 3; of the 9 lost, 6 were declared complete but failed verification and 3 timed out (see `analysis/failures.md`). **The four-benchmark macro average is −1.10 [−5.08, +3.05], short of the +3 target**: the ASI gain is cancelled by the HLE and TB2 losses. Also, **Base timed out on 31/89 TB2 tasks** (3-hour limit). Local A6000 inference is slow, and in Terminus-2 63% of wall time is spent waiting for commands (measured in a pilot), which drives the timeout rate up. The conditions are identical for every model.
 
 6. **E_agent is below Base on TB2 (33.71 vs 41.57, −7.87 [−16.85, +1.12])**: it loses 12 tasks and gains 5; median turns per task 30 (Base 16), timeouts 35 (Base 31). Our hypothesis: shortening command wait durations in training (to cut idle waiting) made the model poll more often, and on local A6000 inference every extra turn regenerates a thinking block, so total time and timeouts went up. The "less idle waiting" design backfired under slow inference; this still needs a controlled ablation.
 
@@ -209,7 +209,7 @@ After the runs, all agent logs were audited for keywords (`hidden_truth`, `/refe
 
 ## 6. Known limitations and deviations
 
-Compute was the lab's 3x A6000 (the server has no Docker and no rootless-podman rights) plus a personal Modal account that hit its spend cap twice (final cap $200). Trade-offs made under these constraints:
+Compute was the lab's 3x A6000 (the server has no Docker and no rootless-podman rights) plus a self-funded Modal account (spend cap raised from $45 to $100 to $200; actual bill $208.48). Trade-offs made under these constraints:
 
 1. **Number of experts**: 3 were planned (SWE, terminal, reasoning); merged into 2 for time.
 2. **Terminal-Bench was run once** (the spec asks for the mean and std of 5 runs), so run-to-run variance is not reported, only paired bootstrap CIs. E_agent's TB2 evaluation did not finish before the deadline.
@@ -226,8 +226,12 @@ Compute was the lab's 3x A6000 (the server has no Docker and no rootless-podman 
 | Item | Value |
 |---|---|
 | Local GPUs (RTX A6000, free) | ~50 GPU-hours (training ~14.3; data generation ~6; TB2 ~24; dev and pilots ~6) |
-| Modal (H100 inference + CPU sandboxes) | $154 as of 05:00 UTC (vLLM / H100 $89.6, TB2 / SWE sandboxes $48.5, ASI containers $16.0); final numbers in `logs/resources.csv` |
-| OpenAI (HLE judge o3-mini + ASI task judges gpt-5.5) | ~$40 (estimate) |
+| **Modal (actual bill, paid personally)** | **$208.48**: H100 inference (vLLM) $106.49; evaluation sandboxes $86.00; ASI runner containers $15.99 |
+| of which: reserved-capacity pilot | ~$42: the 8-task TB2 pilot was billed for the full 32 CPU / 48GB reservation; switching to usage-based limits cut the unit cost ~100x |
+| of which: orphaned sandboxes | ~$11: after force-killing jobs, some Modal sandboxes were not closed and ran until their timeout (10-17 04:00–16:00 UTC) |
+| **OpenAI (judges, personal API key)** | ~$40 (estimate): ~13.5K o3-mini calls for the official HLE judge; gpt-5.5 for ASI task judges; exact figure on the OpenAI bill |
+| Hugging Face, GitHub | $0 |
+| **Total out-of-pocket** | **~$250** |
 | Active work hours | ~20 h (self-reported; the rest was unattended background runs), see `logs/worklog.md` |
 
 GPU-hours = number of GPUs × wall time; Modal costs come from the `modal.billing` export.

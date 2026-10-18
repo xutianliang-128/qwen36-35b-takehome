@@ -12,6 +12,7 @@ import gzip
 import datetime as dt
 import json
 import random
+import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -133,7 +134,8 @@ def main():
             if bench.startswith("hle"):
                 row["truncated_or_forced"] = sum(bool(v.get("truncated")) for v in per.values())
             if m != BASE and bench in data.get(BASE, {}):
-                ci = paired_ci(per, data[BASE][bench], rng)
+                # independent, order-free seed per comparison: CIs do not shift when other runs are added
+                ci = paired_ci(per, data[BASE][bench], random.Random(zlib.crc32(f"{m}|{bench}".encode())))
                 unc[f"{m}|{bench}"] = ci
                 row.update(diff_vs_base_pp=ci["diff_pp"], ci95_low=ci["ci95"][0], ci95_high=ci["ci95"][1])
             rows.append(row)
@@ -150,6 +152,7 @@ def main():
                                                for b in have) / len(have), 2) if have else None}
         if m != BASE and have and all(b in data.get(BASE, {}) for b in have):
             boots = []
+            rng = random.Random(zlib.crc32(f"{m}|macro".encode()))
             for _ in range(2000):  # resample tasks independently within each benchmark
                 ds = []
                 for b in have:
